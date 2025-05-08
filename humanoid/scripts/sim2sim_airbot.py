@@ -1,0 +1,304 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Copyright (c) 2024 Beijing RobotEra TECHNOLOGY CO.,LTD. All rights reserved.
+
+
+import math
+import numpy as np
+import mujoco, mujoco_viewer
+from tqdm import tqdm
+from collections import deque
+from scipy.spatial.transform import Rotation as R
+import torch
+import random
+import argparse
+
+
+class Sim2simCfg:
+    class sim_config:
+        mujoco_model_path = '/home/yurong/humanoid-gym/resources/robots/airbot/airbot_play_v3_0_gripper.xml'  # Update with your actual path
+        sim_duration = 60.0
+        dt = 1/60
+        decimation = 2
+
+    class env:
+        num_actions = 6  # 6 joints for the airbot
+        num_single_obs = 25  # Adapt based on your observation space
+        num_observations = num_single_obs  # Will be updated if frame_stack > 1
+        frame_stack = 1  # Modify if you use frame stacking
+
+    class robot_config:
+        # Default joint positions (home position)
+        home_position = np.zeros(6, dtype=np.double)
+        # Joint limits
+        joint_lower_limits = np.array([-3.14, -2.96, -0.087, -2.96, -1.74, -3.14], dtype=np.double)
+        joint_upper_limits = np.array([2.09, 0.17, 3.14,  2.96, 1.74, 3.14], dtype=np.double)
+
+    class normalization:
+        obs_scales = type('', (), {})()
+        obs_scales.lin_vel = 1.0
+        obs_scales.ang_vel = 0.25
+        obs_scales.dof_pos = 1.0
+        obs_scales.dof_vel = 0.05
+        
+        clip_observations = 100.0
+        clip_actions = 1.5
+        
+    class control:
+        action_scale = 0.5  # Scale for joint position commands
+
+
+class ReachTaskConfig:
+    """Configuration for the reaching task"""
+    def __init__(self):
+        # Target position ranges (similar to your command ranges)
+        self.pos_range_x = (0.35, 0.65)
+        self.pos_range_y = (-0.2, 0.2)
+        self.pos_range_z = (0.15, 0.5)
+        self.pos_range_roll=(0,0)
+        self.pos_range_pitch=(math.pi,math.pi)
+        self.pos_range_yaw=(-math.pi/2, math.pi/2)
+        
+        # Current target position
+        self.target_pos = np.array([
+            random.uniform(*self.pos_range_x),
+            random.uniform(*self.pos_range_y),
+            random.uniform(*self.pos_range_z)
+        ])
+        self.target_rpy = np.array([
+            random.uniform(*self.pos_range_roll),
+            random.uniform(*self.pos_range_pitch),
+            random.uniform(*self.pos_range_yaw)
+        ])
+
+        # Target update frequency (in seconds)
+        self.target_update_time = 4.0
+        self.time_since_last_update = 0.0
+    
+    def update_target(self, dt):
+        """Update target position if needed"""
+        self.time_since_last_update += dt
+        if self.time_since_last_update >= self.target_update_time:
+            self.target_pos[0] = random.uniform(*self.pos_range_x)
+            self.target_pos[1] = random.uniform(*self.pos_range_y)
+            self.target_pos[2] = random.uniform(*self.pos_range_z)
+
+            self.target_rpy[0] = random.uniform(*self.pos_range_roll)
+            self.target_rpy[1] = random.uniform(*self.pos_range_pitch)
+            self.target_rpy[2] = random.uniform(*self.pos_range_yaw)
+            self.time_since_last_update = 0.0
+            return True
+        return False
+
+
+def get_obs(model,data, cfg, task_cfg):
+    """Extract observations from the MuJoCo data structure
+    
+    Args:
+        data: MuJoCo simulation data
+        cfg: Configuration object
+        task_cfg: Task configuration
+        
+    Returns:
+        Observation vector matching the training environment's format
+    """
+    # Extract joint positions and velocities
+    q = data.qpos[-cfg.env.num_actions:].astype(np.double)
+    dq = data.qvel[-cfg.env.num_actions:].astype(np.double)
+    
+    # Create observation vector
+    obs = np.zeros(cfg.env.num_single_obs, dtype=np.float32)
+    
+    # 1. Joint positions (normalized)
+    obs[0:6] = q * cfg.normalization.obs_scales.dof_pos
+    
+    # 2. Joint velocities (normalized)
+    obs[6:12] = dq * cfg.normalization.obs_scales.dof_vel
+    # print(f"Joint positions: {obs[0:6]}, Joint velocities: {obs[6:12]}")
+    # 3.  end-effector position (command)
+    # ✳️ Add link6 pose and orientation
+    link6_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "link6")
+    if link6_id != -1:
+        pos = data.xpos[link6_id]
+        quat = data.xquat[link6_id]
+        # Optional: reorder to (x, y, z, w) if needed
+        obs[12:15] = pos
+        obs[15:19] = quat  # or link6_quat[[1,2,3,0]] if you want xyzw format
+        # print(f"Link6 position: {pos}, orientation (quat): {quat}")
+    else:
+        print("Warning: 'link6' not found in the model.")
+    
+    # 6. Previous action (will be updated in the main loop)
+    obs[19:25] = np.zeros(6)  # Will store the previous action
+    
+    return obs
+
+
+def run_mujoco(policy, cfg, task_cfg):
+    """Run the MuJoCo simulation with the provided policy
+    
+    Args:
+        policy: PyTorch policy model
+        cfg: Simulation configuration
+        task_cfg: Task configuration
+        
+    Returns:
+        None
+    """
+    # Load model and initialize data
+    model = mujoco.MjModel.from_xml_path(cfg.sim_config.mujoco_model_path)
+    model.opt.timestep = cfg.sim_config.dt
+    data = mujoco.MjData(model)
+    
+    # Initialize MuJoCo
+    mujoco.mj_step(model, data)
+    viewer = mujoco_viewer.MujocoViewer(model, data)
+    
+    # Initialize control variables
+    target_q = np.zeros(cfg.env.num_actions, dtype=np.double)
+    action = np.zeros(cfg.env.num_actions, dtype=np.double)
+    prev_action = np.zeros(cfg.env.num_actions, dtype=np.double)
+    
+    # Initialize observation history for frame stacking if used
+    hist_obs = deque()
+    for _ in range(cfg.env.frame_stack):
+        hist_obs.append(np.zeros(cfg.env.num_single_obs, dtype=np.float32))
+    
+    # Initialize simulation counter
+    count_lowlevel = 0
+    first_action = True 
+    target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'target')
+    if target_body_id == -1:
+        print("Warning: 'target' body not found in model")
+
+    # Main simulation loop
+    total_steps = int(cfg.sim_config.sim_duration / cfg.sim_config.dt)
+    for step in tqdm(range(total_steps), desc="Simulating..."):
+        dt = cfg.sim_config.dt
+        
+        # Update target if needed
+        if task_cfg.update_target(dt):
+            print(f"New target: {task_cfg.target_pos}")
+        if target_body_id != -1:
+            # 如果target是mocap body
+            if model.body_mocapid[target_body_id] != -1:
+                mocap_id = model.body_mocapid[target_body_id]
+                data.mocap_pos[mocap_id] = task_cfg.target_pos
+                # # 如果需要设置方向
+                # rot_matrix = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_matrix()
+                # data.mocap_quat[mocap_id] = R.from_matrix(rot_matrix).as_quat()
+
+
+        # Get current joint positions and velocities
+        q = data.qpos[-cfg.env.num_actions:].astype(np.double)
+        dq = data.qvel[-cfg.env.num_actions:].astype(np.double)
+        
+        # Policy runs at lower frequency (100Hz)
+        if count_lowlevel % cfg.sim_config.decimation == 0:
+            # Get full observation
+            obs = get_obs(model,data, cfg, task_cfg)
+            # Update the previous action in observation
+            obs[19:25] = prev_action
+            
+            # Update observation history
+            hist_obs.append(obs)
+            hist_obs.popleft()
+            
+            # Prepare input for policy
+            if cfg.env.frame_stack > 1:
+                policy_input = np.zeros([1, cfg.env.num_observations], dtype=np.float32)
+                for i in range(cfg.env.frame_stack):
+                    start_idx = i * cfg.env.num_single_obs
+                    end_idx = start_idx + cfg.env.num_single_obs
+                    policy_input[0, start_idx:end_idx] = hist_obs[i]
+            else:
+                policy_input = obs.reshape(1, -1)
+            if first_action:
+                action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
+                # action = np.clip(action, -cfg.normalization.clip_actions, cfg.normalization.clip_actions)
+
+                target_q = action * cfg.control.action_scale
+                prev_action = action.copy()
+                first_action = False 
+            # Run policy
+            # action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
+            # # action = np.clip(action, -cfg.normalization.clip_actions, cfg.normalization.clip_actions)
+            
+            # target_q = action * cfg.control.action_scale
+            # prev_action = action.copy()
+        
+        # Apply position control directly to the joints
+        # Clip targets to joint limits for safety
+        target_q_clipped = np.clip(
+            target_q, 
+            cfg.robot_config.joint_lower_limits, 
+            cfg.robot_config.joint_upper_limits
+        )
+        print(f"Target joint positions (original): {target_q}")
+        print(f"Target joint positions: {target_q_clipped}")
+
+        # Set direct position target for each actuator
+        data.ctrl = target_q_clipped
+
+        # Step simulation
+        mujoco.mj_step(model, data)
+        
+        # Render
+        viewer.render()
+        
+        # Increment counter
+        count_lowlevel += 1
+    
+    # Close viewer when done
+    viewer.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment')
+    parser.add_argument('--load_model', type=str, required=True,
+                      help='Path to the trained policy model')
+    parser.add_argument('--model_path', type=str, default='/home/yurong/humanoid-gym/resources/robots/airbot/airbot_play_v3_0_gripper.xml',
+                      help='Path to the MuJoCo XML model file')
+    args = parser.parse_args()
+    
+    # Update configuration with command line arguments
+    cfg = Sim2simCfg()
+    cfg.sim_config.mujoco_model_path = args.model_path
+    
+    # For frame stacking, adjust observation dimension
+    if cfg.env.frame_stack > 1:
+        cfg.env.num_observations = cfg.env.num_single_obs * cfg.env.frame_stack
+    
+    # Initialize task configuration
+    task_cfg = ReachTaskConfig()
+    
+    # Load policy
+    policy = torch.jit.load(args.load_model)
+    
+    # Run simulation
+    run_mujoco(policy, cfg, task_cfg)
