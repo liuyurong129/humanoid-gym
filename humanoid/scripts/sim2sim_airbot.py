@@ -42,7 +42,7 @@ import argparse
 class Sim2simCfg:
     class sim_config:
         mujoco_model_path = '/home/yurong/humanoid-gym/resources/robots/airbot/airbot_play_v3_0_gripper.xml'  # Update with your actual path
-        sim_duration = 60.0
+        sim_duration = 600.0
         dt = 1/60
         decimation = 2
 
@@ -97,7 +97,7 @@ class ReachTaskConfig:
         ])
 
         # Target update frequency (in seconds)
-        self.target_update_time = 4.0
+        self.target_update_time = 100.0
         self.time_since_last_update = 0.0
     
     def update_target(self, dt):
@@ -141,18 +141,10 @@ def get_obs(model,data, cfg, task_cfg):
     obs[6:12] = dq * cfg.normalization.obs_scales.dof_vel
     # print(f"Joint positions: {obs[0:6]}, Joint velocities: {obs[6:12]}")
     # 3.  end-effector position (command)
-    # ✳️ Add link6 pose and orientation
-    link6_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "link6")
-    if link6_id != -1:
-        pos = data.xpos[link6_id]
-        quat = data.xquat[link6_id]
-        # Optional: reorder to (x, y, z, w) if needed
-        obs[12:15] = pos
-        obs[15:19] = quat  # or link6_quat[[1,2,3,0]] if you want xyzw format
-        # print(f"Link6 position: {pos}, orientation (quat): {quat}")
-    else:
-        print("Warning: 'link6' not found in the model.")
-    
+
+    obs[12:15] = task_cfg.target_pos
+    quat = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
+    obs[15:19] = quat
     # 6. Previous action (will be updated in the main loop)
     obs[19:25] = np.zeros(6)  # Will store the previous action
     
@@ -184,6 +176,10 @@ def run_mujoco(policy, cfg, task_cfg):
     action = np.zeros(cfg.env.num_actions, dtype=np.double)
     prev_action = np.zeros(cfg.env.num_actions, dtype=np.double)
     
+    # 初始化目标切换的计时器
+    action_timer = 0.0
+    switch_interval = 5.0  
+    
     # Initialize observation history for frame stacking if used
     hist_obs = deque()
     for _ in range(cfg.env.frame_stack):
@@ -196,10 +192,16 @@ def run_mujoco(policy, cfg, task_cfg):
     if target_body_id == -1:
         print("Warning: 'target' body not found in model")
 
+    # 用于存储下一个目标位置
+    target_next = np.zeros(cfg.env.num_actions, dtype=np.double)
+    
     # Main simulation loop
     total_steps = int(cfg.sim_config.sim_duration / cfg.sim_config.dt)
     for step in tqdm(range(total_steps), desc="Simulating..."):
         dt = cfg.sim_config.dt
+        
+        # 更新动作计时器
+        action_timer += dt
         
         # Update target if needed
         if task_cfg.update_target(dt):
@@ -238,19 +240,26 @@ def run_mujoco(policy, cfg, task_cfg):
                     policy_input[0, start_idx:end_idx] = hist_obs[i]
             else:
                 policy_input = obs.reshape(1, -1)
+                
+            # 始终计算下一个目标位置，即使不立即使用
+            new_action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
+            target_next = new_action * cfg.control.action_scale
+            
             if first_action:
-                action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
-                # action = np.clip(action, -cfg.normalization.clip_actions, cfg.normalization.clip_actions)
-
+                action = new_action
                 target_q = action * cfg.control.action_scale
                 prev_action = action.copy()
                 first_action = False 
-            # Run policy
-            # action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
-            # # action = np.clip(action, -cfg.normalization.clip_actions, cfg.normalization.clip_actions)
-            
-            # target_q = action * cfg.control.action_scale
-            # prev_action = action.copy()
+                # 重置计时器
+                action_timer = 0.0
+        
+        # 检查是否需要切换到下一个目标
+        if action_timer >= switch_interval:
+            print(f"动作已执行 {switch_interval} 秒，切换到新动作")
+            new_action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
+            target_next = new_action * cfg.control.action_scale
+            target_q = target_next.copy()  # 将下一个目标作为当前目标
+            action_timer = 0.0  # 重置计时器
         
         # Apply position control directly to the joints
         # Clip targets to joint limits for safety
@@ -259,9 +268,12 @@ def run_mujoco(policy, cfg, task_cfg):
             cfg.robot_config.joint_lower_limits, 
             cfg.robot_config.joint_upper_limits
         )
-        print(f"Target joint positions (original): {target_q}")
-        print(f"Target joint positions: {target_q_clipped}")
-
+        
+        if step % 60 == 0 or action_timer < 0.1:  # 每秒或切换后立即打印
+            print(f"当前动作计时: {action_timer:.2f}秒")
+            print(f"当前目标: {target_q}")
+            print(f"下一目标: {target_next}")
+        
         # Set direct position target for each actuator
         data.ctrl = target_q_clipped
 
@@ -284,6 +296,8 @@ if __name__ == '__main__':
                       help='Path to the trained policy model')
     parser.add_argument('--model_path', type=str, default='/home/yurong/humanoid-gym/resources/robots/airbot/airbot_play_v3_0_gripper.xml',
                       help='Path to the MuJoCo XML model file')
+    parser.add_argument('--switch_interval', type=float, default=3.0,
+                      help='Time interval (seconds) between switching actions')
     args = parser.parse_args()
     
     # Update configuration with command line arguments
