@@ -294,7 +294,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment')
     parser.add_argument('--load_model', type=str, required=True,
                       help='Path to the trained policy model')
-    parser.add_argument('--model_path', type=str, default='/home/yurong/humanoid-gym/resources/robots/airbot/airbot_play_v3_0_gripper.xml',
+    parser.add_argument('--model_path', type=str, default='/home/LYR/humanoid-gym/resources/robots/airbot/airbot_play_v3_0_gripper.xml',
                       help='Path to the MuJoCo XML model file')
     parser.add_argument('--switch_interval', type=float, default=3.0,
                       help='Time interval (seconds) between switching actions')

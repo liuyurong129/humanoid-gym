@@ -17,6 +17,8 @@ class Sim2simCfg:
         sim_duration = 60.0
         dt = 1/60
         decimation = 2
+        # dt =0.001
+        # decimation = 1
 
     class env:
         num_actions = 6  # 6 joints for the airbot
@@ -54,12 +56,12 @@ class ReachTaskConfig:
     def __init__(self):
         # Target position ranges (similar to your command ranges)
         self.pos_range_x = (0.35, 0.65)
-        self.pos_range_y = (-0.2, 0.2)
+        self.pos_range_y = (-0.2,0.2)
         self.pos_range_z = (0.15, 0.5)
-        self.pos_range_roll = (0, 0)
-        self.pos_range_pitch = (math.pi, math.pi)
-        # self.pos_range_yaw = (-math.pi/2, math.pi/2)
-        self.pos_range_yaw = (0, 0)
+        self.pos_range_roll = (math.pi/2, math.pi/2)
+        self.pos_range_pitch = (math.pi/2, math.pi*3/2)
+        self.pos_range_yaw = (math.pi/2, math.pi/2)
+        # self.pos_range_yaw = (0, 0)
         # Current target position
         self.target_pos = np.array([
             random.uniform(*self.pos_range_x),
@@ -184,10 +186,10 @@ def create_target_visual(position, rpy=None):
     global current_axis_visuals
 
     # 默认无旋转
-    # if rpy is not None:
-    #     quat = p.getQuaternionFromEuler(rpy)
-    # else:
-    quat = [0, 0, 0, 1]
+    if rpy is not None:
+        quat = p.getQuaternionFromEuler(rpy)
+    else:
+        quat = [0, 0, 0, 1]
 
     rot_matrix = np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3)
     origin = np.array(position)
@@ -214,8 +216,6 @@ def create_target_visual(position, rpy=None):
         current_axis_visuals.append(line_id)
 
 def update_target_visual(position, rpy=None):
-    #sensor end posi  = [ 0.18620586, -0.29552791,  0.01374099]
-    position_Relative = np.array([0.18620586, -0.29552791,  0.01374099], dtype=np.double)
     create_target_visual(position, rpy)
 
 link6_axis_visuals = []
@@ -337,6 +337,8 @@ def get_obs(robot_id, joint_indices, end_effector_link, cfg, task_cfg):
     # 3. Target position and orientation
     obs[12:15] = task_cfg.target_pos
     quat = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
+    # Convert to [x, y, z, w] format
+    quat = np.array([quat[1], quat[2], quat[3], quat[0]])
     obs[15:19] = quat
     
     # 4. Previous action (will be updated in the main loop)
@@ -441,14 +443,11 @@ def run_pybullet(policy, cfg, task_cfg, gui=True):
                 targetPosition=target_q_clipped[i],
                 maxVelocity=5.0  # Optional: limit velocity of the movement
             )
-        
         # Step simulation
         p.stepSimulation()
         # link6_pos, link6_quat = get_link_state(robot_id, cfg.robot_config.end_effector_link)
         # link6_rpy = p.getEulerFromQuaternion(link6_quat)
         # draw_axes(link6_pos, link6_rpy, visuals_list=link6_axis_visuals)
-
-
         # If using GUI, maintain real-time simulation
         if gui:
             time.sleep(dt)
@@ -464,7 +463,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment (PyBullet)')
     parser.add_argument('--load_model', type=str, required=True,
                       help='Path to the trained policy model')
-    parser.add_argument('--model_path', type=str, default='/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper.urdf',
+    parser.add_argument('--model_path', type=str, default='/home/LYR/airbot_usd/urdf/airbot_play_v3_0_gripper.urdf',
                       help='Path to the robot URDF file')
     parser.add_argument('--switch_interval', type=float, default=3.0,
                       help='Time interval (seconds) between switching actions')
