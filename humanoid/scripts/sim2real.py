@@ -1,0 +1,270 @@
+import math
+import numpy as np
+import time
+from tqdm import tqdm
+from collections import deque
+from scipy.spatial.transform import Rotation as R
+import torch
+import random
+import argparse
+import airbot
+
+# Create robot instance
+robot = airbot.create_agent(can_interface="can0", end_mode="gripper")
+
+class Sim2simCfg:
+    class sim_config:
+        sim_duration = 60.0
+        dt = 0.005
+        decimation = 2
+
+    class env:
+        num_actions = 6  # 6 joints for the airbot
+        num_single_obs = 25  # Adapt based on your observation space
+        num_observations = num_single_obs  # Will be updated if frame_stack > 1
+        frame_stack = 1  # Modify if you use frame stacking
+
+    class robot_config:
+        # Joint limits (from previous configuration)
+        joint_lower_limits = np.array([-3.14, -2.96, -0.087, -2.96, -1.74, -3.14], dtype=np.double)
+        joint_upper_limits = np.array([2.09, 0.17, 3.14,  2.96, 1.74, 3.14], dtype=np.double)
+        joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+        end_effector_link = "link6"
+
+    class normalization:
+        obs_scales = type('', (), {})()
+        obs_scales.lin_vel = 1.0
+        obs_scales.ang_vel = 0.25
+        obs_scales.dof_pos = 1.0
+        obs_scales.dof_vel = 0.05
+        
+        clip_observations = 100.0
+        clip_actions = 1.5
+        
+    class control:
+        action_scale = 0.5  # Scale for joint position commands
+
+
+class ReachTaskConfig:
+    """Configuration for the reaching task"""
+    def __init__(self):
+        # Target position ranges (similar to your command ranges)
+        self.pos_range_x = (0.35, 0.65)
+        self.pos_range_y = (-0.2,0.2)
+        self.pos_range_z = (0.15, 0.5)
+        self.pos_range_roll = (math.pi/2, math.pi/2)
+        self.pos_range_pitch = (math.pi/2, math.pi*3/2)
+        self.pos_range_yaw = (math.pi/2, math.pi/2)
+        # self.pos_range_yaw = (0, 0)
+        # Current target position
+        self.target_pos = np.array([
+            random.uniform(*self.pos_range_x),
+            random.uniform(*self.pos_range_y),
+            random.uniform(*self.pos_range_z)
+        ])
+        self.target_rpy = np.array([
+            random.uniform(*self.pos_range_roll),
+            random.uniform(*self.pos_range_pitch),
+            random.uniform(*self.pos_range_yaw)
+        ])
+
+        # Target update frequency (in seconds)
+        self.target_update_time = 4.0
+        self.time_since_last_update = 0.0
+        
+        # Target visualization (will be initialized in the main function)
+        self.target_visual_id = None
+    
+    def update_target(self, dt):
+        """Update target position if needed"""
+        self.time_since_last_update += dt
+        if self.time_since_last_update >= self.target_update_time:
+            self.target_pos[0] = random.uniform(*self.pos_range_x)
+            self.target_pos[1] = random.uniform(*self.pos_range_y)
+            self.target_pos[2] = random.uniform(*self.pos_range_z)
+
+            self.target_rpy[0] = random.uniform(*self.pos_range_roll)
+            self.target_rpy[1] = random.uniform(*self.pos_range_pitch)
+            self.target_rpy[2] = random.uniform(*self.pos_range_yaw)
+            self.time_since_last_update = 0.0
+            return True
+        return False
+
+
+def get_joint_states(robot):
+    """Get joint positions and velocities using AirBot API
+    
+    Args:
+        robot: AirBot robot instance
+        
+    Returns:
+        Joint positions and velocities as numpy arrays
+    """
+    # Get current joint positions
+    positions = robot.get_current_joint_q()
+
+    # Get current joint velocities
+    velocities = robot.get_current_joint_v()
+    print(f"Joint Positions: {positions}")
+    print(f"Joint Velocities: {velocities}")
+    return np.array(positions), np.array(velocities)
+
+
+def get_obs(robot, cfg, task_cfg):
+    """Extract observations matching the format used in training
+    
+    Args:
+        robot: AirBot robot instance
+        cfg: Configuration object
+        task_cfg: Task configuration
+        
+    Returns:
+        Observation vector
+    """
+    # Get joint positions and velocities
+    q, dq = get_joint_states(robot)
+    
+    # Create observation vector
+    obs = np.zeros(cfg.env.num_single_obs, dtype=np.float32)
+    
+    # 1. Joint positions (normalized)
+    obs[0:6] = q * cfg.normalization.obs_scales.dof_pos
+    
+    # 2. Joint velocities (normalized)
+    obs[6:12] = dq * cfg.normalization.obs_scales.dof_vel
+    
+    # 3. Target position and orientation
+    obs[12:15] = task_cfg.target_pos
+    quat = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
+    # Convert to [x, y, z, w] format
+    quat = np.array([quat[1], quat[2], quat[3], quat[0]])
+    obs[15:19] = quat
+    
+    # 4. Previous action (will be updated in the main loop)
+    obs[19:25] = np.zeros(6)
+
+    return obs
+
+
+def run_robot(policy, cfg, task_cfg):
+    """Run the robot simulation with the provided policy
+    
+    Args:
+        policy: PyTorch policy model
+        cfg: Simulation configuration
+        task_cfg: Task configuration
+        
+    Returns:
+        None
+    """
+    # Initialize control variables
+    target_q = np.zeros(cfg.env.num_actions, dtype=np.double)
+    action = np.zeros(cfg.env.num_actions, dtype=np.double)
+    prev_action = np.zeros(cfg.env.num_actions, dtype=np.double)
+    
+    # Initialize observation history for frame stacking if used
+    hist_obs = deque()
+    for _ in range(cfg.env.frame_stack):
+        hist_obs.append(np.zeros(cfg.env.num_single_obs, dtype=np.float32))
+    
+    # Initialize simulation counter
+    count_lowlevel = 0
+    
+    # Calculate total simulation steps
+    dt = cfg.sim_config.dt
+    total_steps = int(cfg.sim_config.sim_duration / dt)
+    
+    # Print initial target information
+    print(f"Fixed Target Position: {task_cfg.target_pos}")
+    quati = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
+    # Convert to [x, y, z, w] format
+    quati = np.array([quati[1], quati[2], quati[3], quati[0]])
+    print(f"Fixed Target Orientation (RPY): {quati}")
+    
+    # Main simulation loop
+    for step in tqdm(range(total_steps), desc="Running Robot..."):
+        # Policy runs at lower frequency (based on decimation factor)
+        if count_lowlevel % cfg.sim_config.decimation == 0:
+            # Get full observation
+            obs = get_obs(robot, cfg, task_cfg)
+            
+            # Update the previous action in observation
+            obs[19:25] = prev_action
+
+            # Update observation history
+            hist_obs.append(obs)
+            hist_obs.popleft()
+            
+            # Prepare input for policy
+            if cfg.env.frame_stack > 1:
+                policy_input = np.zeros([1, cfg.env.num_observations], dtype=np.float32)
+                for i in range(cfg.env.frame_stack):
+                    start_idx = i * cfg.env.num_single_obs
+                    end_idx = start_idx + cfg.env.num_single_obs
+                    policy_input[0, start_idx:end_idx] = hist_obs[i]
+            else:
+                policy_input = obs.reshape(1, -1)
+            print(f"Policy Input: {policy_input}")
+            # Always calculate next target position
+            action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
+            target_q = action * cfg.control.action_scale
+            
+            # Clip actions to joint limits
+            target_q_clipped = np.clip(
+                target_q, 
+                cfg.robot_config.joint_lower_limits, 
+                cfg.robot_config.joint_upper_limits
+            )
+            print(f"Target Joint Positions: {target_q_clipped}")
+            # Send target joint positions to robot
+            try:
+                robot.set_target_joint_q(target_q_clipped,  vel=0.2, use_planning=False)
+                posi = robot.get_current_joint_q()
+                print(f"Current Joint Positions: {posi}")
+                effector_pos = robot.get_current_translation()
+                print(f"End Effector Position: {effector_pos}")
+                quata = robot.get_current_rotation() 
+                print(f"End Effector Rotation: {quata}")
+                
+            except Exception as e:
+                print(f"Error setting joint positions: {e}")
+                break
+            
+            # Store previous action
+            prev_action = action
+        
+        # Wait for the duration of one timestep
+        time.sleep(dt)
+        
+        # Increment counter
+        count_lowlevel += 1
+    
+    # Optional: Move to home position when done
+    try:
+        robot.set_target_joint_q(np.zeros(6), vel=0.2, use_planning=False)
+        time.sleep(10)
+    except Exception as e:
+        print(f"Error moving to home position: {e}")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment')
+    parser.add_argument('--load_model', type=str, required=True,
+                      help='Path to the trained policy model')
+    args = parser.parse_args()
+    
+    # Update configuration 
+    cfg = Sim2simCfg()
+    
+    # For frame stacking, adjust observation dimension
+    if cfg.env.frame_stack > 1:
+        cfg.env.num_observations = cfg.env.num_single_obs * cfg.env.frame_stack
+    
+    # Initialize task configuration
+    task_cfg = ReachTaskConfig()
+    
+    # Load policy
+    policy = torch.jit.load(args.load_model)
+    
+    # Run robot simulation
+    run_robot(policy, cfg, task_cfg)
