@@ -12,10 +12,55 @@ import airbot
 # Create robot instance
 robot = airbot.create_agent(can_interface="can0", end_mode="gripper")
 
+def compute_pose_error_numpy(
+    t_current: np.ndarray,
+    q_current: np.ndarray,
+    t_target: np.ndarray,
+    q_target: np.ndarray,
+    rot_error_type: str = "axis_angle",
+):
+    """
+    Compute position and rotation error between current and target pose using numpy.
+
+    Args:
+        t_current: Current position, shape (3,)
+        q_current: Current orientation as quaternion [x, y, z, w]
+        t_target: Target position, shape (3,)
+        q_target: Target orientation as quaternion [x, y, z, w]
+        rot_error_type: "quat" or "axis_angle"
+
+    Returns:
+        pos_error: (3,)
+        rot_error: (3,) if "axis_angle", (4,) if "quat"
+    """
+    # Position error
+    pos_error = t_target - t_current
+
+    # Normalize input quaternions
+    q_current = q_current / np.linalg.norm(q_current)
+    q_target = q_target / np.linalg.norm(q_target)
+
+    # Compute inverse of current quaternion
+    q_current_inv = np.array([ -q_current[0], -q_current[1], -q_current[2], q_current[3] ])  # conjugate
+
+    # Quaternion multiplication: q_error = q_target * q_current_inv
+    r_target = R.from_quat(q_target)
+    r_current_inv = R.from_quat(q_current_inv)
+    r_error = r_target * r_current_inv
+
+    if rot_error_type == "quat":
+        rot_error = r_error.as_quat()  # [x, y, z, w]
+    elif rot_error_type == "axis_angle":
+        rot_error = r_error.as_rotvec()  # [rx, ry, rz], length is angle in radians
+    else:
+        raise ValueError("Unsupported rot_error_type. Use 'quat' or 'axis_angle'.")
+
+    return pos_error, rot_error
+
 class Sim2simCfg:
     class sim_config:
         sim_duration = 60.0
-        dt = 0.005
+        dt = 1/35
         decimation = 2
 
     class env:
@@ -105,8 +150,6 @@ def get_joint_states(robot):
 
     # Get current joint velocities
     velocities = robot.get_current_joint_v()
-    print(f"Joint Positions: {positions}")
-    print(f"Joint Velocities: {velocities}")
     return np.array(positions), np.array(velocities)
 
 
@@ -175,16 +218,25 @@ def run_robot(policy, cfg, task_cfg):
     total_steps = int(cfg.sim_config.sim_duration / dt)
     
     # Print initial target information
-    print(f"Fixed Target Position: {task_cfg.target_pos}")
+    # print(f"Initial Target Position: {task_cfg.target_pos}")
     quati = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
     # Convert to [x, y, z, w] format
     quati = np.array([quati[1], quati[2], quati[3], quati[0]])
-    print(f"Fixed Target Orientation (RPY): {quati}")
+    # print(f"Initial Target Orientation (XYZW): {quati}")
     
     # Main simulation loop
     for step in tqdm(range(total_steps), desc="Running Robot..."):
         # Policy runs at lower frequency (based on decimation factor)
         if count_lowlevel % cfg.sim_config.decimation == 0:
+            # 在每个控制周期检查是否需要更新目标位置
+            # Check if target needs to be updated (passing the actual elapsed time)
+            if task_cfg.update_target(dt * cfg.sim_config.decimation):
+                # print(f"New Target Position: {task_cfg.target_pos}")
+                new_quat = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
+                # Convert to [x, y, z, w] format
+                new_quat = np.array([new_quat[1], new_quat[2], new_quat[3], new_quat[0]])
+                # print(f"New Target Orientation (XYZW): {new_quat}")
+            
             # Get full observation
             obs = get_obs(robot, cfg, task_cfg)
             
@@ -204,8 +256,11 @@ def run_robot(policy, cfg, task_cfg):
                     policy_input[0, start_idx:end_idx] = hist_obs[i]
             else:
                 policy_input = obs.reshape(1, -1)
-            print(f"Policy Input: {policy_input}")
-            # Always calculate next target position
+            
+            # 打印policy输入中的target位置，用于调试
+            # print(f"Target in policy input: Pos={policy_input[0, 12:15]}, Quat={policy_input[0, 15:19]}")
+            
+            # Calculate next action
             action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
             target_q = action * cfg.control.action_scale
             
@@ -215,17 +270,36 @@ def run_robot(policy, cfg, task_cfg):
                 cfg.robot_config.joint_lower_limits, 
                 cfg.robot_config.joint_upper_limits
             )
-            print(f"Target Joint Positions: {target_q_clipped}")
+            # print(f"Target Joint Positions: {target_q_clipped}")
             # Send target joint positions to robot
             try:
-                robot.set_target_joint_q(target_q_clipped,  vel=0.2, use_planning=False)
-                posi = robot.get_current_joint_q()
-                print(f"Current Joint Positions: {posi}")
+                robot.set_target_joint_q(target_q_clipped, vel=0.8, blocking=False)
+
                 effector_pos = robot.get_current_translation()
-                print(f"End Effector Position: {effector_pos}")
-                quata = robot.get_current_rotation() 
-                print(f"End Effector Rotation: {quata}")
-                
+                effector_quat = robot.get_current_rotation()  # [x, y, z, w] 格式
+
+                print(f"End Effector target pos: {task_cfg.target_pos}")
+                print(f"End Effector actual pos: {effector_pos}")
+
+                # 构造目标朝向四元数：ZYX 欧拉角转四元数，注意需要转换为 [x, y, z, w]
+                target_euler = task_cfg.target_rpy[::-1]  # 从 RPY → YXZ
+                target_quat = R.from_euler('ZYX', target_euler).as_quat()  # 得到 [x, y, z, w]
+
+                print(f"End Effector target quat: {target_quat}")
+                print(f"End Effector actual quat: {effector_quat}")
+
+                # --- 统一误差估计 ---
+                pos_error, rot_error = compute_pose_error_numpy(
+                    t_current=np.array(effector_pos),
+                    q_current=np.array(effector_quat),
+                    t_target=np.array(task_cfg.target_pos),
+                    q_target=np.array(target_quat),
+                    rot_error_type="axis_angle",  # 或 "quat"
+                )
+                rot_norm = np.linalg.norm(rot_error)-math.pi
+                print(f"Position error: {pos_error}, Norm: {np.linalg.norm(pos_error):.4f}")
+                print(f"Rotation error: {rot_error}, Angle (rad): {np.linalg.norm(rot_norm):.4f}")
+
             except Exception as e:
                 print(f"Error setting joint positions: {e}")
                 break
@@ -241,7 +315,8 @@ def run_robot(policy, cfg, task_cfg):
     
     # Optional: Move to home position when done
     try:
-        robot.set_target_joint_q(np.zeros(6), vel=0.2, use_planning=False)
+        print("Task completed, moving to home position...")
+        robot.set_target_joint_q(np.zeros(6), vel=0.2)
         time.sleep(10)
     except Exception as e:
         print(f"Error moving to home position: {e}")
@@ -251,6 +326,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment')
     parser.add_argument('--load_model', type=str, required=True,
                       help='Path to the trained policy model')
+    parser.add_argument('--target_update_time', type=float, default=10.0,
+                      help='Time interval (seconds) between target updates')
     args = parser.parse_args()
     
     # Update configuration 
@@ -262,6 +339,8 @@ if __name__ == '__main__':
     
     # Initialize task configuration
     task_cfg = ReachTaskConfig()
+    # 应用命令行参数设置的目标更新时间
+    task_cfg.target_update_time = args.target_update_time
     
     # Load policy
     policy = torch.jit.load(args.load_model)
