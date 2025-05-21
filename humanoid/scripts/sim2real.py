@@ -14,6 +14,142 @@ import matplotlib.pyplot as plt
 
 # Create robot instance
 robot = airbot.create_agent(can_interface="can0", end_mode="gripper")
+# Create a global filter instance (to be initialized in main)
+joint_state_filter = None
+
+class ActionFilter:
+    """A filter to smooth robot actions and prevent oscillation"""
+    def __init__(self, filter_size=5, decay_factor=0.85, max_change_rate=0.05):
+        """
+        Initialize action filter
+        
+        Args:
+            filter_size: Size of the moving average window
+            decay_factor: Weight decay for exponential averaging (0-1)
+            max_change_rate: Maximum allowed change in action per timestep
+        """
+        self.filter_size = filter_size
+        self.decay_factor = decay_factor
+        self.max_change_rate = max_change_rate
+        self.action_history = []
+        self.previous_filtered_action = None
+    
+    def filter(self, new_action):
+        """
+        Filter the action to reduce oscillation
+        
+        Args:
+            new_action: The new action from the policy
+            
+        Returns:
+            filtered_action: Smoothed action
+        """
+        # Add new action to history
+        self.action_history.append(new_action)
+        
+        # Keep history to the specified size
+        if len(self.action_history) > self.filter_size:
+            self.action_history.pop(0)
+        
+        # Simple moving average
+        ma_action = np.mean(self.action_history, axis=0)
+        
+        # Apply exponential smoothing if previous action exists
+        if self.previous_filtered_action is not None:
+            exp_smoothed = (self.decay_factor * self.previous_filtered_action + 
+                           (1 - self.decay_factor) * new_action)
+            
+            # Limit rate of change
+            if self.max_change_rate > 0:
+                action_change = exp_smoothed - self.previous_filtered_action
+                norm_change = np.linalg.norm(action_change)
+                
+                if norm_change > self.max_change_rate:
+                    # Scale down the change to be within limits
+                    scaled_change = action_change * (self.max_change_rate / norm_change)
+                    filtered_action = self.previous_filtered_action + scaled_change
+                else:
+                    filtered_action = exp_smoothed
+            else:
+                filtered_action = exp_smoothed
+        else:
+            # First action, use moving average
+            filtered_action = ma_action
+        
+        # Update previous filtered action
+        self.previous_filtered_action = filtered_action
+        
+        return filtered_action
+
+
+class JointStateFilter:
+    """A filter to smooth joint position and velocity readings to reduce oscillation"""
+    def __init__(self, filter_size=5, decay_factor=0.85, moving_avg_weight=0.6):
+        """
+        Initialize joint state filter
+        
+        Args:
+            filter_size: Size of the moving average window
+            decay_factor: Weight decay for exponential averaging (0-1)
+            moving_avg_weight: Weight for moving average vs exponential smoothing
+        """
+        self.filter_size = filter_size
+        self.decay_factor = decay_factor
+        self.moving_avg_weight = moving_avg_weight
+        self.position_history = []
+        self.velocity_history = []
+        self.prev_filtered_position = None
+        self.prev_filtered_velocity = None
+    
+    def filter(self, new_position, new_velocity):
+        """
+        Filter joint states to reduce noise and oscillation
+        
+        Args:
+            new_position: New joint position readings
+            new_velocity: New joint velocity readings
+            
+        Returns:
+            filtered_position, filtered_velocity: Smoothed joint states
+        """
+        # Add new readings to history
+        self.position_history.append(new_position)
+        self.velocity_history.append(new_velocity)
+        
+        # Keep history to the specified size
+        if len(self.position_history) > self.filter_size:
+            self.position_history.pop(0)
+        if len(self.velocity_history) > self.filter_size:
+            self.velocity_history.pop(0)
+        
+        # Simple moving average
+        ma_position = np.mean(self.position_history, axis=0)
+        ma_velocity = np.mean(self.velocity_history, axis=0)
+        
+        # Apply exponential smoothing if previous values exist
+        if self.prev_filtered_position is not None and self.prev_filtered_velocity is not None:
+            # Exponential smoothing for position and velocity
+            exp_smoothed_position = (self.decay_factor * self.prev_filtered_position + 
+                                    (1 - self.decay_factor) * new_position)
+            exp_smoothed_velocity = (self.decay_factor * self.prev_filtered_velocity + 
+                                    (1 - self.decay_factor) * new_velocity)
+            
+            # Combine moving average and exponential smoothing
+            filtered_position = (self.moving_avg_weight * ma_position + 
+                                (1 - self.moving_avg_weight) * exp_smoothed_position)
+            filtered_velocity = (self.moving_avg_weight * ma_velocity + 
+                                (1 - self.moving_avg_weight) * exp_smoothed_velocity)
+        else:
+            # First reading, use moving average
+            filtered_position = ma_position
+            filtered_velocity = ma_velocity
+        
+        # Update previous filtered values
+        self.prev_filtered_position = filtered_position
+        self.prev_filtered_velocity = filtered_velocity
+        
+        return filtered_position, filtered_velocity
+
 
 class Sim2simCfg:
     class sim_config:
@@ -41,7 +177,17 @@ class Sim2simCfg:
         
     class control:
         action_scale = 0.5  # Scale for joint position commands
-
+        # Action filter parameters
+        use_action_filter = True  # Whether to use action filtering
+        filter_size = 5  # Size of action history for moving average
+        decay_factor = 0.85  # Weight for exponential smoothing (higher = more smoothing)
+        max_change_rate = 0.05  # Maximum allowed change per timestep
+        
+        # Joint state filter parameters
+        use_joint_state_filter = True  # Whether to use joint state filtering
+        joint_filter_size = 5  # Size of joint state history for moving average
+        joint_decay_factor = 0.85  # Weight for exponential smoothing
+        joint_moving_avg_weight = 0.6  # Weight for moving average vs exponential smoothing
 
 class ReachTaskConfig:
     """Configuration for the reaching task"""
@@ -314,22 +460,31 @@ def compute_pose_error_numpy(
 
     return pos_error, rot_error
 
-
 def get_joint_states(robot):
-    """Get joint positions and velocities using AirBot API
+    """Get filtered joint positions and velocities using AirBot API
     
     Args:
         robot: AirBot robot instance
         
     Returns:
-        Joint positions and velocities as numpy arrays
+        Filtered joint positions and velocities as numpy arrays
     """
-    # Get current joint positions
-    positions = robot.get_current_joint_q()
-
-    # Get current joint velocities
-    velocities = robot.get_current_joint_v()
-    return np.array(positions), np.array(velocities)
+    global joint_state_filter
+    
+    # Get raw joint positions and velocities
+    raw_positions = robot.get_current_joint_q()
+    raw_velocities = robot.get_current_joint_v()
+    
+    # Apply filtering if the filter is initialized
+    if joint_state_filter is not None:
+        filtered_positions, filtered_velocities = joint_state_filter.filter(
+            np.array(raw_positions), 
+            np.array(raw_velocities)
+        )
+        return filtered_positions, filtered_velocities
+    else:
+        # If filter is not initialized, return raw values
+        return np.array(raw_positions), np.array(raw_velocities)
 
 
 def get_obs(robot, cfg, task_cfg):
@@ -385,6 +540,23 @@ def run_robot(policy, cfg, task_cfg):
     prev_action = np.zeros(cfg.env.num_actions, dtype=np.double)
     current_target_q_clipped = np.zeros(cfg.env.num_actions, dtype=np.double)
     
+    # Initialize action filter if enabled
+    action_filter = None
+    if cfg.control.use_action_filter:
+        action_filter = ActionFilter(
+            filter_size=cfg.control.filter_size,
+            decay_factor=cfg.control.decay_factor,
+            max_change_rate=cfg.control.max_change_rate
+        )
+        print("Action filtering enabled to prevent oscillation")
+    
+    # Display joint state filter status
+    if cfg.control.use_joint_state_filter and joint_state_filter is not None:
+        print(f"Joint state filtering enabled with:")
+        print(f"  - Filter size: {cfg.control.joint_filter_size}")
+        print(f"  - Decay factor: {cfg.control.joint_decay_factor}")
+        print(f"  - Moving average weight: {cfg.control.joint_moving_avg_weight}")
+    
     # Initialize data recorder
     data_recorder = JointDataRecorder(robot, sampling_rate=50)
     # Initialize observation history for frame stacking if used
@@ -409,6 +581,10 @@ def run_robot(policy, cfg, task_cfg):
     def get_current_target_q():
         return current_target_q_clipped
     
+    # Store raw joint values for debugging
+    raw_joint_positions_log = []
+    filtered_joint_positions_log = []
+    
     # Start recording data in a separate thread
     import threading
     recording_thread = threading.Thread(target=data_recorder.start_recording, args=(get_current_target_q,))
@@ -427,8 +603,17 @@ def run_robot(policy, cfg, task_cfg):
                     # Convert to [x, y, z, w] format
                     new_quat = np.array([new_quat[1], new_quat[2], new_quat[3], new_quat[0]])
                 
-                # Get full observation
+                # Get raw joint positions for debugging
+                if cfg.control.use_joint_state_filter:
+                    raw_positions = robot.get_current_joint_q()
+                    raw_joint_positions_log.append(raw_positions)
+                
+                # Get filtered observations
                 obs = get_obs(robot, cfg, task_cfg)
+                
+                # Store filtered joint positions if filtering is enabled
+                if cfg.control.use_joint_state_filter:
+                    filtered_joint_positions_log.append(obs[0:6])
                 
                 # Update the previous action in observation
                 obs[19:25] = prev_action
@@ -448,7 +633,15 @@ def run_robot(policy, cfg, task_cfg):
                     policy_input = obs.reshape(1, -1)
                 
                 # Calculate next action
-                action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
+                raw_action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
+                
+                # Apply action filtering if enabled
+                if action_filter is not None:
+                    action = action_filter.filter(raw_action)
+                else:
+                    action = raw_action
+                
+                # Scale the action
                 target_q = action * cfg.control.action_scale
                 
                 # Clip actions to joint limits
@@ -492,6 +685,16 @@ def run_robot(policy, cfg, task_cfg):
                     print(f"Position error: {pos_error}, Norm: {np.linalg.norm(pos_error):.4f}")
                     print(f"Rotation error: {rot_error}, Angle (rad): {np.linalg.norm(rot_norm):.4f}")
 
+                    # Print joint state filtering effect if enabled
+                    if cfg.control.use_joint_state_filter and len(raw_joint_positions_log) > 0:
+                        raw_pos = np.array(raw_joint_positions_log[-1])
+                        filtered_pos = np.array(filtered_joint_positions_log[-1])
+                        filter_diff = np.linalg.norm(raw_pos - filtered_pos)
+                        print(f"Joint filter effect (norm): {filter_diff:.6f}")
+                        if filter_diff > 0.05:  # Only show detailed joint diffs if significant
+                            print(f"  Raw joints: {raw_pos}")
+                            print(f"  Filtered: {filtered_pos}")
+
                 except Exception as e:
                     print(f"Error setting joint positions: {e}")
                     break
@@ -512,6 +715,33 @@ def run_robot(policy, cfg, task_cfg):
         # Stop recording before moving to home position
         print("停止记录数据...")
         data_recorder.stop_recording()
+        
+        # Plot joint filter comparison if enabled
+        if cfg.control.use_joint_state_filter and len(raw_joint_positions_log) > 0:
+            try:
+                print("生成关节滤波对比图...")
+                plt.figure(figsize=(15, 10))
+                
+                # Convert logs to numpy arrays for easier plotting
+                raw_positions_array = np.array(raw_joint_positions_log)
+                filtered_positions_array = np.array(filtered_joint_positions_log)
+                
+                # Plot comparison for each joint
+                for i in range(6):  # 6 joints
+                    plt.subplot(3, 2, i+1)
+                    plt.plot(raw_positions_array[:, i], 'r-', label='Raw')
+                    plt.plot(filtered_positions_array[:, i], 'b-', label='Filtered')
+                    plt.title(f'Joint {i+1} Filtering')
+                    plt.xlabel('Time Step')
+                    plt.ylabel('Joint Position (rad)')
+                    plt.legend()
+                    plt.grid(True)
+                
+                plt.tight_layout()
+                plt.savefig('./data/joint_filtering_comparison.png', dpi=300)
+                print("滤波效果对比图已保存至 './data/joint_filtering_comparison.png'")
+            except Exception as e:
+                print(f"生成滤波对比图时出错: {e}")
         
         # Move to home position when done
         try:
@@ -534,15 +764,48 @@ def run_robot(policy, cfg, task_cfg):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment')
+    parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment with Filtering')
     parser.add_argument('--load_model', type=str, required=True,
                       help='Path to the trained policy model')
     parser.add_argument('--target_update_time', type=float, default=10.0,
                       help='Time interval (seconds) between target updates')
+    
+    # Action filter parameters
+    parser.add_argument('--use_filter', type=bool, default=True,
+                      help='Enable action filtering to prevent oscillation')
+    parser.add_argument('--filter_size', type=int, default=5,
+                      help='Size of action history for moving average')
+    parser.add_argument('--decay_factor', type=float, default=0.85,
+                      help='Weight for exponential smoothing (higher = more smoothing)')
+    parser.add_argument('--max_change_rate', type=float, default=0.05,
+                      help='Maximum allowed change in action per timestep')
+    
+    # Joint state filter parameters
+    parser.add_argument('--use_joint_filter', type=bool, default=True,
+                      help='Enable joint state filtering')
+    parser.add_argument('--joint_filter_size', type=int, default=5,
+                      help='Size of joint state history for moving average')
+    parser.add_argument('--joint_decay_factor', type=float, default=0.85,
+                      help='Weight for exponential smoothing for joint states')
+    parser.add_argument('--joint_moving_avg_weight', type=float, default=0.6,
+                      help='Weight for moving average vs exponential smoothing for joint states')
+    
     args = parser.parse_args()
     
     # Update configuration 
     cfg = Sim2simCfg()
+    
+    # Apply command line arguments for action filtering
+    cfg.control.use_action_filter = args.use_filter
+    cfg.control.filter_size = args.filter_size
+    cfg.control.decay_factor = args.decay_factor
+    cfg.control.max_change_rate = args.max_change_rate
+    
+    # Apply command line arguments for joint state filtering
+    cfg.control.use_joint_state_filter = args.use_joint_filter
+    cfg.control.joint_filter_size = args.joint_filter_size
+    cfg.control.joint_decay_factor = args.joint_decay_factor
+    cfg.control.joint_moving_avg_weight = args.joint_moving_avg_weight
     
     # For frame stacking, adjust observation dimension
     if cfg.env.frame_stack > 1:
@@ -552,6 +815,17 @@ if __name__ == '__main__':
     task_cfg = ReachTaskConfig()
     # 应用命令行参数设置的目标更新时间
     task_cfg.target_update_time = args.target_update_time
+    
+    # Initialize the joint state filter
+    # global joint_state_filter
+
+    if cfg.control.use_joint_state_filter:
+        joint_state_filter = JointStateFilter(
+            filter_size=cfg.control.joint_filter_size,
+            decay_factor=cfg.control.joint_decay_factor,
+            moving_avg_weight=cfg.control.joint_moving_avg_weight
+        )
+        print("Joint state filtering enabled to reduce sensing noise and oscillation")
     
     # Load policy
     policy = torch.jit.load(args.load_model)
