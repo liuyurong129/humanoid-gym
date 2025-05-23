@@ -54,13 +54,13 @@
   <statistic meansize="0.172126" extent="0.690271" center="0.0206251 -0.00105258 0.167563" />
 
   <asset>
-    <mesh name="base_link" file="/home/LYR/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/base_link.STL" />
-    <mesh name="link1" file="/home/LYR/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link1.STL" />
-    <mesh name="link2" file="/home/LYR/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link2.STL" />
-    <mesh name="link3" file="/home/LYR/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link3.STL" />
-    <mesh name="link4" file="/home/LYR/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link4.STL" />
-    <mesh name="link5" file="/home/LYR/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link5.STL" />
-    <mesh name="link6" file="/home/LYR/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link6.STL" />
+    <mesh name="base_link" file="/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/base_link.STL" />
+    <mesh name="link1" file="/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link1.STL" />
+    <mesh name="link2" file="/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link2.STL" />
+    <mesh name="link3" file="/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link3.STL" />
+    <mesh name="link4" file="/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link4.STL" />
+    <mesh name="link5" file="/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link5.STL" />
+    <mesh name="link6" file="/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper/meshes/link6.STL" />
     <texture name="texplane" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 0.15 0.2"
         width="512" height="512" mark="cross" markrgb=".8 .8 .8"/>
     <material name="matplane" reflectance="0." texture="texplane" texrepeat="1 1" texuniform="true" />

@@ -1,3 +1,4 @@
+#identified前后的对比看看是不是模型的问题，训一个不抖的
 import math
 import numpy as np
 import time
@@ -8,61 +9,153 @@ import torch
 import random
 import argparse
 import airbot
-import matplotlib.pyplot as plt
-import os
 import csv
+import os
+import matplotlib.pyplot as plt
+
 # Create robot instance
 robot = airbot.create_agent(can_interface="can0", end_mode="none")
+# Create a global filter instance (to be initialized in main)
+joint_state_filter = None
 
-def compute_pose_error_numpy(
-    t_current: np.ndarray,
-    q_current: np.ndarray,
-    t_target: np.ndarray,
-    q_target: np.ndarray,
-    rot_error_type: str = "axis_angle",
-):
-    """
-    Compute position and rotation error between current and target pose using numpy.
+class ActionFilter:
+    """A filter to smooth robot actions and prevent oscillation"""
+    def __init__(self, filter_size=5, decay_factor=0.85, max_change_rate=0.05):
+        """
+        Initialize action filter
+        
+        Args:
+            filter_size: Size of the moving average window
+            decay_factor: Weight decay for exponential averaging (0-1)
+            max_change_rate: Maximum allowed change in action per timestep
+        """
+        self.filter_size = filter_size
+        self.decay_factor = decay_factor
+        self.max_change_rate = max_change_rate
+        self.action_history = []
+        self.previous_filtered_action = None
+    
+    def filter(self, new_action):
+        """
+        Filter the action to reduce oscillation
+        
+        Args:
+            new_action: The new action from the policy
+            
+        Returns:
+            filtered_action: Smoothed action
+        """
+        # Add new action to history
+        self.action_history.append(new_action)
+        
+        # Keep history to the specified size
+        if len(self.action_history) > self.filter_size:
+            self.action_history.pop(0)
+        
+        # Simple moving average
+        ma_action = np.mean(self.action_history, axis=0)
+        
+        # Apply exponential smoothing if previous action exists
+        if self.previous_filtered_action is not None:
+            exp_smoothed = (self.decay_factor * self.previous_filtered_action + 
+                           (1 - self.decay_factor) * new_action)
+            
+            # Limit rate of change
+            if self.max_change_rate > 0:
+                action_change = exp_smoothed - self.previous_filtered_action
+                norm_change = np.linalg.norm(action_change)
+                
+                if norm_change > self.max_change_rate:
+                    # Scale down the change to be within limits
+                    scaled_change = action_change * (self.max_change_rate / norm_change)
+                    filtered_action = self.previous_filtered_action + scaled_change
+                else:
+                    filtered_action = exp_smoothed
+            else:
+                filtered_action = exp_smoothed
+        else:
+            # First action, use moving average
+            filtered_action = ma_action
+        
+        # Update previous filtered action
+        self.previous_filtered_action = filtered_action
+        
+        return filtered_action
 
-    Args:
-        t_current: Current position, shape (3,)
-        q_current: Current orientation as quaternion [x, y, z, w]
-        t_target: Target position, shape (3,)
-        q_target: Target orientation as quaternion [x, y, z, w]
-        rot_error_type: "quat" or "axis_angle"
 
-    Returns:
-        pos_error: (3,)
-        rot_error: (3,) if "axis_angle", (4,) if "quat"
-    """
-    # Position error
-    pos_error = t_target - t_current
+class JointStateFilter:
+    """A filter to smooth joint position and velocity readings to reduce oscillation"""
+    def __init__(self, filter_size=5, decay_factor=0.85, moving_avg_weight=0.6):
+        """
+        Initialize joint state filter
+        
+        Args:
+            filter_size: Size of the moving average window
+            decay_factor: Weight decay for exponential averaging (0-1)
+            moving_avg_weight: Weight for moving average vs exponential smoothing
+        """
+        self.filter_size = filter_size
+        self.decay_factor = decay_factor
+        self.moving_avg_weight = moving_avg_weight
+        self.position_history = []
+        self.velocity_history = []
+        self.prev_filtered_position = None
+        self.prev_filtered_velocity = None
+    
+    def filter(self, new_position, new_velocity):
+        """
+        Filter joint states to reduce noise and oscillation
+        
+        Args:
+            new_position: New joint position readings
+            new_velocity: New joint velocity readings
+            
+        Returns:
+            filtered_position, filtered_velocity: Smoothed joint states
+        """
+        # Add new readings to history
+        self.position_history.append(new_position)
+        self.velocity_history.append(new_velocity)
+        
+        # Keep history to the specified size
+        if len(self.position_history) > self.filter_size:
+            self.position_history.pop(0)
+        if len(self.velocity_history) > self.filter_size:
+            self.velocity_history.pop(0)
+        
+        # Simple moving average
+        ma_position = np.mean(self.position_history, axis=0)
+        ma_velocity = np.mean(self.velocity_history, axis=0)
+        
+        # Apply exponential smoothing if previous values exist
+        if self.prev_filtered_position is not None and self.prev_filtered_velocity is not None:
+            # Exponential smoothing for position and velocity
+            exp_smoothed_position = (self.decay_factor * self.prev_filtered_position + 
+                                    (1 - self.decay_factor) * new_position)
+            exp_smoothed_velocity = (self.decay_factor * self.prev_filtered_velocity + 
+                                    (1 - self.decay_factor) * new_velocity)
+            
+            # Combine moving average and exponential smoothing
+            filtered_position = (self.moving_avg_weight * ma_position + 
+                                (1 - self.moving_avg_weight) * exp_smoothed_position)
+            filtered_velocity = (self.moving_avg_weight * ma_velocity + 
+                                (1 - self.moving_avg_weight) * exp_smoothed_velocity)
+        else:
+            # First reading, use moving average
+            filtered_position = ma_position
+            filtered_velocity = ma_velocity
+        
+        # Update previous filtered values
+        self.prev_filtered_position = filtered_position
+        self.prev_filtered_velocity = filtered_velocity
+        
+        return filtered_position, filtered_velocity
 
-    # Normalize input quaternions
-    q_current = q_current / np.linalg.norm(q_current)
-    q_target = q_target / np.linalg.norm(q_target)
-
-    # Compute inverse of current quaternion
-    q_current_inv = np.array([ -q_current[0], -q_current[1], -q_current[2], q_current[3] ])  # conjugate
-
-    # Quaternion multiplication: q_error = q_target * q_current_inv
-    r_target = R.from_quat(q_target)
-    r_current_inv = R.from_quat(q_current_inv)
-    r_error = r_target * r_current_inv
-
-    if rot_error_type == "quat":
-        rot_error = r_error.as_quat()  # [x, y, z, w]
-    elif rot_error_type == "axis_angle":
-        rot_error = r_error.as_rotvec()  # [rx, ry, rz], length is angle in radians
-    else:
-        raise ValueError("Unsupported rot_error_type. Use 'quat' or 'axis_angle'.")
-
-    return pos_error, rot_error
 
 class Sim2simCfg:
     class sim_config:
         sim_duration = 60.0
-        dt = 1/35
+        dt = 1/200
         decimation = 2
 
     class env:
@@ -80,17 +173,22 @@ class Sim2simCfg:
 
     class normalization:
         obs_scales = type('', (), {})()
-        obs_scales.lin_vel = 1.0
-        obs_scales.ang_vel = 0.25
         obs_scales.dof_pos = 1.0
-        obs_scales.dof_vel = 0.05
-        
-        clip_observations = 100.0
-        clip_actions = 1.5
+        obs_scales.dof_vel = 1.0
         
     class control:
         action_scale = 0.5  # Scale for joint position commands
-
+        # Action filter parameters
+        use_action_filter = True  # Whether to use action filtering
+        filter_size = 5  # Size of action history for moving average
+        decay_factor = 0.85  # Weight for exponential smoothing (higher = more smoothing)
+        max_change_rate = 0.05  # Maximum allowed change per timestep
+        
+        # Joint state filter parameters
+        use_joint_state_filter = True  # Whether to use joint state filtering
+        joint_filter_size = 5  # Size of joint state history for moving average
+        joint_decay_factor = 0.85  # Weight for exponential smoothing
+        joint_moving_avg_weight = 0.6  # Weight for moving average vs exponential smoothing
 
 class ReachTaskConfig:
     """Configuration for the reaching task"""
@@ -98,7 +196,7 @@ class ReachTaskConfig:
         # Target position ranges (similar to your command ranges)
         self.pos_range_x = (0.35, 0.65)
         self.pos_range_y = (-0.2,0.2)
-        self.pos_range_z = (0.15, 0.5)
+        self.pos_range_z = (0.2, 0.4)
         self.pos_range_roll = (math.pi/2, math.pi/2)
         self.pos_range_pitch = (math.pi/2, math.pi*3/2)
         self.pos_range_yaw = (math.pi/2, math.pi/2)
@@ -118,7 +216,7 @@ class ReachTaskConfig:
         # Target update frequency (in seconds)
         self.target_update_time = 4.0
         self.time_since_last_update = 0.0
-        
+        self.target_history = [] 
         # Target visualization (will be initialized in the main function)
         self.target_visual_id = None
     
@@ -133,61 +231,97 @@ class ReachTaskConfig:
             self.target_rpy[0] = random.uniform(*self.pos_range_roll)
             self.target_rpy[1] = random.uniform(*self.pos_range_pitch)
             self.target_rpy[2] = random.uniform(*self.pos_range_yaw)
+            current_time = time.time()
+            self.target_history.append({
+                "timestamp": current_time,
+                "position": self.target_pos.copy(),
+                "rpy": self.target_rpy.copy()
+            })
             self.time_since_last_update = 0.0
             return True
         return False
+    def save_target_history(self, filename="target_history.csv"):
+        with open(filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['timestamp', 'x', 'y', 'z', 'roll', 'pitch', 'yaw'])
+            for entry in self.target_history:
+                writer.writerow([
+                    entry["timestamp"],
+                    *entry["position"],
+                    *entry["rpy"]
+                ])
+        print(f"目标历史记录已保存至: {filename}")
 
 class JointDataRecorder:
-    def __init__(self, robot, sampling_rate=100, recording_time=10):
+    def __init__(self, robot, sampling_rate=50):
         """
         初始化关节数据记录器
         
         参数:
         robot: 机械臂对象，需要有get_current_joint_q方法
         sampling_rate: 采样率(Hz)
-        recording_time: 记录时间(秒)
         """
         self.robot = robot
         self.sampling_rate = sampling_rate
-        self.recording_time = recording_time
         self.target_q_data = []
         self.actual_q_data = []
         self.timestamps = []
         self.num_joints = 6  # 假设是6自由度机械臂
+        self.start_time = None
+        self.recording = False
+        self.stop_requested = False
         
-    def record_data(self, target_q_function):
+    def start_recording(self, target_q_function):
         """
-        记录目标关节角度和实际关节角度数据
+        开始记录目标关节角度和实际关节角度数据
         
         参数:
         target_q_function: 返回target_q_clipped的函数
         """
-        print(f"开始记录数据，将持续 {self.recording_time} 秒...")
-        num_samples = int(self.sampling_rate * self.recording_time)
+        self.recording = True
+        self.stop_requested = False
+        self.start_time = time.time()
+        print("开始记录数据，将持续到机械臂运动结束...")
         
-        for i in range(num_samples):
-            start_time = time.time()
+        sample_count = 0
+        last_progress_time = time.time()
+        
+        while not self.stop_requested:
+            loop_start_time = time.time()
             
             # 获取目标关节角度和实际关节角度
             target_q = target_q_function()
             actual_q = self.robot.get_current_joint_q()
             
             # 记录时间戳和数据
-            self.timestamps.append(i / self.sampling_rate)
+            curr_time = time.time() - self.start_time
+            self.timestamps.append(curr_time)
             self.target_q_data.append(target_q)
             self.actual_q_data.append(actual_q)
             
             # 控制采样率
-            elapsed = time.time() - start_time
+            elapsed = time.time() - loop_start_time
             sleep_time = max(0, 1/self.sampling_rate - elapsed)
             time.sleep(sleep_time)
             
-            # 显示进度
-            if i % (self.sampling_rate // 2) == 0:
-                print(f"进度: {i/num_samples*100:.1f}%")
+            sample_count += 1
+            
+            # 每隔几秒显示一次进度
+            if time.time() - last_progress_time > 5:
+                print(f"数据记录中... 已记录 {sample_count} 个采样点，耗时 {curr_time:.1f} 秒")
+                last_progress_time = time.time()
         
-        print("数据记录完成!")
+        self.recording = False
+        record_duration = time.time() - self.start_time
+        print(f"数据记录完成! 共记录了 {len(self.timestamps)} 个采样点，持续了 {record_duration:.1f} 秒")
     
+    def stop_recording(self):
+        """停止记录数据"""
+        self.stop_requested = True
+        while self.recording:
+            time.sleep(0.1)  # 等待记录线程停止
+        print("数据记录已停止")
+        
     def save_to_csv(self, folder="./data"):
         """将记录的数据保存为CSV文件"""
         if not os.path.exists(folder):
@@ -281,21 +415,77 @@ class JointDataRecorder:
         plt.show()
         print("图表已生成并保存为 './data/joint_angles_comparison.png'")
 
+
+def compute_pose_error_numpy(
+    t_current: np.ndarray,
+    q_current: np.ndarray,
+    t_target: np.ndarray,
+    q_target: np.ndarray,
+    rot_error_type: str = "axis_angle",
+):
+    """
+    Compute position and rotation error between current and target pose using numpy.
+
+    Args:
+        t_current: Current position, shape (3,)
+        q_current: Current orientation as quaternion [x, y, z, w]
+        t_target: Target position, shape (3,)
+        q_target: Target orientation as quaternion [x, y, z, w]
+        rot_error_type: "quat" or "axis_angle"
+
+    Returns:
+        pos_error: (3,)
+        rot_error: (3,) if "axis_angle", (4,) if "quat"
+    """
+    # Position error
+    pos_error = t_target - t_current
+
+    # Normalize input quaternions
+    q_current = q_current / np.linalg.norm(q_current)
+    q_target = q_target / np.linalg.norm(q_target)
+
+    # Compute inverse of current quaternion
+    q_current_inv = np.array([ -q_current[0], -q_current[1], -q_current[2], q_current[3] ])  # conjugate
+
+    # Quaternion multiplication: q_error = q_target * q_current_inv
+    r_target = R.from_quat(q_target)
+    r_current_inv = R.from_quat(q_current_inv)
+    r_error = r_target * r_current_inv
+
+    if rot_error_type == "quat":
+        rot_error = r_error.as_quat()  # [x, y, z, w]
+    elif rot_error_type == "axis_angle":
+        rot_error = r_error.as_rotvec()  # [rx, ry, rz], length is angle in radians
+    else:
+        raise ValueError("Unsupported rot_error_type. Use 'quat' or 'axis_angle'.")
+
+    return pos_error, rot_error
+
 def get_joint_states(robot):
-    """Get joint positions and velocities using AirBot API
+    """Get filtered joint positions and velocities using AirBot API
     
     Args:
         robot: AirBot robot instance
         
     Returns:
-        Joint positions and velocities as numpy arrays
+        Filtered joint positions and velocities as numpy arrays
     """
-    # Get current joint positions
-    positions = robot.get_current_joint_q()
-
-    # Get current joint velocities
-    velocities = robot.get_current_joint_v()
-    return np.array(positions), np.array(velocities)
+    global joint_state_filter
+    
+    # Get raw joint positions and velocities
+    raw_positions = robot.get_current_joint_q()
+    raw_velocities = robot.get_current_joint_v()
+    
+    # Apply filtering if the filter is initialized
+    if joint_state_filter is not None:
+        filtered_positions, filtered_velocities = joint_state_filter.filter(
+            np.array(raw_positions), 
+            np.array(raw_velocities)
+        )
+        return filtered_positions, filtered_velocities
+    else:
+        # If filter is not initialized, return raw values
+        return np.array(raw_positions), np.array(raw_velocities)
 
 
 def get_obs(robot, cfg, task_cfg):
@@ -349,7 +539,27 @@ def run_robot(policy, cfg, task_cfg):
     target_q = np.zeros(cfg.env.num_actions, dtype=np.double)
     action = np.zeros(cfg.env.num_actions, dtype=np.double)
     prev_action = np.zeros(cfg.env.num_actions, dtype=np.double)
+    current_target_q_clipped = np.zeros(cfg.env.num_actions, dtype=np.double)
     
+    # Initialize action filter if enabled
+    action_filter = None
+    if cfg.control.use_action_filter:
+        action_filter = ActionFilter(
+            filter_size=cfg.control.filter_size,
+            decay_factor=cfg.control.decay_factor,
+            max_change_rate=cfg.control.max_change_rate
+        )
+        print("Action filtering enabled to prevent oscillation")
+    
+    # Display joint state filter status
+    if cfg.control.use_joint_state_filter and joint_state_filter is not None:
+        print(f"Joint state filtering enabled with:")
+        print(f"  - Filter size: {cfg.control.joint_filter_size}")
+        print(f"  - Decay factor: {cfg.control.joint_decay_factor}")
+        print(f"  - Moving average weight: {cfg.control.joint_moving_avg_weight}")
+    
+    # Initialize data recorder
+    data_recorder = JointDataRecorder(robot, sampling_rate=50)
     # Initialize observation history for frame stacking if used
     hist_obs = deque()
     for _ in range(cfg.env.frame_stack):
@@ -367,116 +577,236 @@ def run_robot(policy, cfg, task_cfg):
     quati = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
     # Convert to [x, y, z, w] format
     quati = np.array([quati[1], quati[2], quati[3], quati[0]])
-    # print(f"Initial Target Orientation (XYZW): {quati}")
     
-    # Main simulation loop
-    for step in tqdm(range(total_steps), desc="Running Robot..."):
-        # Policy runs at lower frequency (based on decimation factor)
-        if count_lowlevel % cfg.sim_config.decimation == 0:
-            # 在每个控制周期检查是否需要更新目标位置
-            # Check if target needs to be updated (passing the actual elapsed time)
-            if task_cfg.update_target(dt * cfg.sim_config.decimation):
-                # print(f"New Target Position: {task_cfg.target_pos}")
-                new_quat = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
-                # Convert to [x, y, z, w] format
-                new_quat = np.array([new_quat[1], new_quat[2], new_quat[3], new_quat[0]])
-                # print(f"New Target Orientation (XYZW): {new_quat}")
-            
-            # Get full observation
-            obs = get_obs(robot, cfg, task_cfg)
-            
-            # Update the previous action in observation
-            obs[19:25] = prev_action
-
-            # Update observation history
-            hist_obs.append(obs)
-            hist_obs.popleft()
-            
-            # Prepare input for policy
-            if cfg.env.frame_stack > 1:
-                policy_input = np.zeros([1, cfg.env.num_observations], dtype=np.float32)
-                for i in range(cfg.env.frame_stack):
-                    start_idx = i * cfg.env.num_single_obs
-                    end_idx = start_idx + cfg.env.num_single_obs
-                    policy_input[0, start_idx:end_idx] = hist_obs[i]
-            else:
-                policy_input = obs.reshape(1, -1)
-            
-            # 打印policy输入中的target位置，用于调试
-            # print(f"Target in policy input: Pos={policy_input[0, 12:15]}, Quat={policy_input[0, 15:19]}")
-            
-            # Calculate next action
-            action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
-            target_q = action * cfg.control.action_scale
-            
-            # Clip actions to joint limits
-            target_q_clipped = np.clip(
-                target_q, 
-                cfg.robot_config.joint_lower_limits, 
-                cfg.robot_config.joint_upper_limits
-            )
-            # print(f"Target Joint Positions: {target_q_clipped}")
-            # Send target joint positions to robot
-            try:
-                robot.set_target_joint_q(target_q_clipped, vel=0.5, blocking=False)
-
-                effector_pos = robot.get_current_translation()
-                effector_quat = robot.get_current_rotation()  # [x, y, z, w] 格式
-
-                print(f"End Effector target pos: {task_cfg.target_pos}")
-                print(f"End Effector actual pos: {effector_pos}")
-
-                # 构造目标朝向四元数：ZYX 欧拉角转四元数，注意需要转换为 [x, y, z, w]
-                target_euler = task_cfg.target_rpy[::-1]  # 从 RPY → YXZ
-                target_quat = R.from_euler('ZYX', target_euler).as_quat()  # 得到 [x, y, z, w]
-
-                print(f"End Effector target quat: {target_quat}")
-                print(f"End Effector actual quat: {effector_quat}")
-
-                # --- 统一误差估计 ---
-                pos_error, rot_error = compute_pose_error_numpy(
-                    t_current=np.array(effector_pos),
-                    q_current=np.array(effector_quat),
-                    t_target=np.array(task_cfg.target_pos),
-                    q_target=np.array(target_quat),
-                    rot_error_type="axis_angle",  # 或 "quat"
-                )
-                rot_norm = np.linalg.norm(rot_error)-math.pi
-                print(f"Position error: {pos_error}, Norm: {np.linalg.norm(pos_error):.4f}")
-                print(f"Rotation error: {rot_error}, Angle (rad): {np.linalg.norm(rot_norm):.4f}")
-
-            except Exception as e:
-                print(f"Error setting joint positions: {e}")
-                break
-            
-            # Store previous action
-            prev_action = action
-        
-        # Wait for the duration of one timestep
-        time.sleep(dt)
-        
-        # Increment counter
-        count_lowlevel += 1
+    # Function to get current target joint positions (for data recorder)
+    def get_current_target_q():
+        return current_target_q_clipped
     
-    # Optional: Move to home position when done
+    # Store raw joint values for debugging
+    raw_joint_positions_log = []
+    filtered_joint_positions_log = []
+    
+    # Start recording data in a separate thread
+    import threading
+    recording_thread = threading.Thread(target=data_recorder.start_recording, args=(get_current_target_q,))
+    recording_thread.daemon = True  # 设为守护线程，主程序结束时会自动终止
+    recording_thread.start()
+
     try:
-        print("Task completed, moving to home position...")
-        robot.set_target_joint_q(np.zeros(6), vel=0.2)
-        time.sleep(10)
-    except Exception as e:
-        print(f"Error moving to home position: {e}")
+        # Main simulation loop
+        for step in tqdm(range(total_steps), desc="Running Robot..."):
+            # Policy runs at lower frequency (based on decimation factor)
+            if count_lowlevel % cfg.sim_config.decimation == 0:
+                # 在每个控制周期检查是否需要更新目标位置
+                # Check if target needs to be updated (passing the actual elapsed time)
+                if task_cfg.update_target(dt * cfg.sim_config.decimation):
+                    new_quat = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
+                    # Convert to [x, y, z, w] format
+                    new_quat = np.array([new_quat[1], new_quat[2], new_quat[3], new_quat[0]])
+                
+                # Get raw joint positions for debugging
+                if cfg.control.use_joint_state_filter:
+                    raw_positions = robot.get_current_joint_q()
+                    raw_joint_positions_log.append(raw_positions)
+                
+                # Get filtered observations
+                obs = get_obs(robot, cfg, task_cfg)
+                
+                # Store filtered joint positions if filtering is enabled
+                if cfg.control.use_joint_state_filter:
+                    filtered_joint_positions_log.append(obs[0:6])
+                
+                # Update the previous action in observation
+                obs[19:25] = prev_action
+
+                # Update observation history
+                hist_obs.append(obs)
+                hist_obs.popleft()
+                
+                # Prepare input for policy
+                if cfg.env.frame_stack > 1:
+                    policy_input = np.zeros([1, cfg.env.num_observations], dtype=np.float32)
+                    for i in range(cfg.env.frame_stack):
+                        start_idx = i * cfg.env.num_single_obs
+                        end_idx = start_idx + cfg.env.num_single_obs
+                        policy_input[0, start_idx:end_idx] = hist_obs[i]
+                else:
+                    policy_input = obs.reshape(1, -1)
+                
+                # Calculate next action
+                raw_action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
+                
+                # Apply action filtering if enabled
+                if action_filter is not None:
+                    action = action_filter.filter(raw_action)
+                else:
+                    action = raw_action
+                
+                # Scale the action
+                target_q = action * cfg.control.action_scale
+                
+                # Clip actions to joint limits
+                target_q_clipped = np.clip(
+                    target_q, 
+                    cfg.robot_config.joint_lower_limits, 
+                    cfg.robot_config.joint_upper_limits
+                )
+                
+                # Update the current target joint positions for data recorder
+                current_target_q_clipped = target_q_clipped.copy()
+                
+                # Send target joint positions to robot
+                try:
+                    robot.set_target_joint_q(target_q_clipped, vel=3.5, blocking=False)
+                    print(f"发送控制命令时间戳: {time.time():.6f} 秒")
+
+                    effector_pos = robot.get_current_translation()
+                    effector_quat = robot.get_current_rotation()  # [x, y, z, w] 格式
+
+                    # Debug position info 
+                    print(f"End Effector target pos: {task_cfg.target_pos}")
+                    print(f"End Effector actual pos: {effector_pos}")
+
+                    # 构造目标朝向四元数：ZYX 欧拉角转四元数，注意需要转换为 [x, y, z, w]
+                    target_euler = task_cfg.target_rpy[::-1]  # 从 RPY → YXZ
+                    target_quat = R.from_euler('ZYX', target_euler).as_quat()  # 得到 [x, y, z, w]
+
+                    print(f"End Effector target quat: {target_quat}")
+                    print(f"End Effector actual quat: {effector_quat}")
+
+                    # --- 统一误差估计 ---
+                    pos_error, rot_error = compute_pose_error_numpy(
+                        t_current=np.array(effector_pos),
+                        q_current=np.array(effector_quat),
+                        t_target=np.array(task_cfg.target_pos),
+                        q_target=np.array(target_quat),
+                        rot_error_type="axis_angle",  # 或 "quat"
+                    )
+                    rot_norm = np.linalg.norm(rot_error)-math.pi
+                    print(f"Position error: {pos_error}, Norm: {np.linalg.norm(pos_error):.4f}")
+                    print(f"Rotation error: {rot_error}, Angle (rad): {np.linalg.norm(rot_norm):.4f}")
+
+                    # Print joint state filtering effect if enabled
+                    if cfg.control.use_joint_state_filter and len(raw_joint_positions_log) > 0:
+                        raw_pos = np.array(raw_joint_positions_log[-1])
+                        filtered_pos = np.array(filtered_joint_positions_log[-1])
+                        filter_diff = np.linalg.norm(raw_pos - filtered_pos)
+                        print(f"Joint filter effect (norm): {filter_diff:.6f}")
+                        if filter_diff > 0.05:  # Only show detailed joint diffs if significant
+                            print(f"  Raw joints: {raw_pos}")
+                            print(f"  Filtered: {filtered_pos}")
+
+                except Exception as e:
+                    print(f"Error setting joint positions: {e}")
+                    break
+                
+                # Store previous action
+                prev_action = action
+            
+            # Wait for the duration of one timestep
+            time.sleep(dt)
+            
+            # Increment counter
+            count_lowlevel += 1
+            
+    except KeyboardInterrupt:
+        print("操作被用户中断")
+    
+    finally:
+        # Stop recording before moving to home position
+        print("停止记录数据...")
+        data_recorder.stop_recording()
+        
+        # Plot joint filter comparison if enabled
+        if cfg.control.use_joint_state_filter and len(raw_joint_positions_log) > 0:
+            try:
+                print("生成关节滤波对比图...")
+                plt.figure(figsize=(15, 10))
+                
+                # Convert logs to numpy arrays for easier plotting
+                raw_positions_array = np.array(raw_joint_positions_log)
+                filtered_positions_array = np.array(filtered_joint_positions_log)
+                
+                # Plot comparison for each joint
+                for i in range(6):  # 6 joints
+                    plt.subplot(3, 2, i+1)
+                    plt.plot(raw_positions_array[:, i], 'r-', label='Raw')
+                    plt.plot(filtered_positions_array[:, i], 'b-', label='Filtered')
+                    plt.title(f'Joint {i+1} Filtering')
+                    plt.xlabel('Time Step')
+                    plt.ylabel('Joint Position (rad)')
+                    plt.legend()
+                    plt.grid(True)
+                
+                plt.tight_layout()
+                plt.savefig('./data/joint_filtering_comparison.png', dpi=300)
+                print("滤波效果对比图已保存至 './data/joint_filtering_comparison.png'")
+            except Exception as e:
+                print(f"生成滤波对比图时出错: {e}")
+        
+        # Move to home position when done
+        try:
+            print("任务完成，机械臂归位中...")
+            robot.set_target_joint_q(np.zeros(6), vel=0.2)
+            time.sleep(5)  # 等待机械臂归位
+            
+            task_cfg.save_target_history("targets.csv")
+            # Save and plot the data
+            print("保存数据并生成图表...")
+            target_file, actual_file = data_recorder.save_to_csv()
+            data_recorder.plot_data(target_file, actual_file)
+            
+        except Exception as e:
+            print(f"归位过程中出错: {e}")
+            # 即使归位出错也保存数据
+            print("保存已记录的数据...")
+            target_file, actual_file = data_recorder.save_to_csv()
+            data_recorder.plot_data(target_file, actual_file)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment')
+    parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment with Filtering')
     parser.add_argument('--load_model', type=str, required=True,
                       help='Path to the trained policy model')
     parser.add_argument('--target_update_time', type=float, default=10.0,
                       help='Time interval (seconds) between target updates')
+    
+    # Action filter parameters
+    parser.add_argument('--use_filter', type=bool, default=False,
+                      help='Enable action filtering to prevent oscillation')
+    parser.add_argument('--filter_size', type=int, default=5,
+                      help='Size of action history for moving average')
+    parser.add_argument('--decay_factor', type=float, default=0.99,
+                      help='Weight for exponential smoothing (higher = more smoothing)')
+    parser.add_argument('--max_change_rate', type=float, default=0.05,
+                      help='Maximum allowed change in action per timestep')
+    
+    # Joint state filter parameters
+    parser.add_argument('--use_joint_filter', type=bool, default=False,
+                      help='Enable joint state filtering')
+    parser.add_argument('--joint_filter_size', type=int, default=5,
+                      help='Size of joint state history for moving average')
+    parser.add_argument('--joint_decay_factor', type=float, default=0.99,
+                      help='Weight for exponential smoothing for joint states')
+    parser.add_argument('--joint_moving_avg_weight', type=float, default=0.6,
+                      help='Weight for moving average vs exponential smoothing for joint states')
+    
     args = parser.parse_args()
     
     # Update configuration 
     cfg = Sim2simCfg()
+    
+    # Apply command line arguments for action filtering
+    cfg.control.use_action_filter = args.use_filter
+    cfg.control.filter_size = args.filter_size
+    cfg.control.decay_factor = args.decay_factor
+    cfg.control.max_change_rate = args.max_change_rate
+    
+    # Apply command line arguments for joint state filtering
+    cfg.control.use_joint_state_filter = args.use_joint_filter
+    cfg.control.joint_filter_size = args.joint_filter_size
+    cfg.control.joint_decay_factor = args.joint_decay_factor
+    cfg.control.joint_moving_avg_weight = args.joint_moving_avg_weight
     
     # For frame stacking, adjust observation dimension
     if cfg.env.frame_stack > 1:
@@ -487,8 +817,19 @@ if __name__ == '__main__':
     # 应用命令行参数设置的目标更新时间
     task_cfg.target_update_time = args.target_update_time
     
+    # Initialize the joint state filter
+    # global joint_state_filter
+
+    if cfg.control.use_joint_state_filter:
+        joint_state_filter = JointStateFilter(
+            filter_size=cfg.control.joint_filter_size,
+            decay_factor=cfg.control.joint_decay_factor,
+            moving_avg_weight=cfg.control.joint_moving_avg_weight
+        )
+        print("Joint state filtering enabled to reduce sensing noise and oscillation")
+    
     # Load policy
     policy = torch.jit.load(args.load_model)
     
-    # Run robot simulation
+    # Run robot with data recording throughout the entire execution
     run_robot(policy, cfg, task_cfg)

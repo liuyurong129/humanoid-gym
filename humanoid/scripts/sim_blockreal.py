@@ -15,7 +15,7 @@ class Sim2simCfg:
     class sim_config:
         urdf_model_path = '/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper.urdf'  # Update with actual URDF path
         sim_duration = 60.0
-        dt = 1/200
+        dt = 1/60
         decimation = 2
 
     class env:
@@ -53,11 +53,11 @@ class ReachTaskConfig:
     """Configuration for the reaching task"""
     def __init__(self):
         # Target position ranges (similar to your command ranges)
-        self.pos_range_x = (0.35, 0.65)
-        self.pos_range_y = (-0.2,0.2)
-        self.pos_range_z = (0.15, 0.5)
+        self.pos_range_x = (0.5, 0.5)
+        self.pos_range_y = (0, 0)
+        self.pos_range_z = (0.3, 0.3)
         self.pos_range_roll = (math.pi/2, math.pi/2)
-        self.pos_range_pitch = (math.pi/2, math.pi*3/2)
+        self.pos_range_pitch = (math.pi, math.pi)
         self.pos_range_yaw = (math.pi/2, math.pi/2)
         # self.pos_range_yaw = (0, 0)
         # Current target position
@@ -422,6 +422,7 @@ def run_pybullet(policy, cfg, task_cfg, gui=True):
                 
             # Always calculate next target position
             action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
+            target_q = action * cfg.control.action_scale
             
         # Apply position control to the joints
         target_q_clipped = np.clip(
@@ -429,26 +430,44 @@ def run_pybullet(policy, cfg, task_cfg, gui=True):
             cfg.robot_config.joint_lower_limits, 
             cfg.robot_config.joint_upper_limits
         )
-
+        print(f"Target joint positions: {target_q_clipped}")
         # Apply pure position control to each joint
-        for i, joint_idx in enumerate(joint_indices):
-            # Direct position control
-            p.setJointMotorControl2(
-                bodyUniqueId=robot_id,
-                jointIndex=joint_idx,
-                controlMode=p.POSITION_CONTROL,
-                targetPosition=target_q_clipped[i],
-                maxVelocity=5.0  # Optional: limit velocity of the movement
-            )
-        prev_action = action
-        # Step simulation
-        p.stepSimulation()
-        # link6_pos, link6_quat = get_link_state(robot_id, cfg.robot_config.end_effector_link)
-        # link6_rpy = p.getEulerFromQuaternion(link6_quat)
-        # draw_axes(link6_pos, link6_rpy, visuals_list=link6_axis_visuals)
-        # If using GUI, maintain real-time simulation
-        if gui:
-            time.sleep(dt)
+        reached_target = False
+        while not reached_target:
+            all_reached = True
+            for i, joint_idx in enumerate(joint_indices):
+                joint_state = p.getJointState(robot_id, joint_idx)
+                current_pos = joint_state[0]
+
+                # 如果当前位置未达到目标位置，则发出控制命令
+                if abs(current_pos - target_q_clipped[i]) > 1e-3:
+                    all_reached = False  # 有至少一个未到
+                    p.setJointMotorControl2(
+                        bodyUniqueId=robot_id,
+                        jointIndex=joint_idx,
+                        controlMode=p.POSITION_CONTROL,
+                        targetPosition=target_q_clipped[i],
+                        maxVelocity=5.0
+                    )
+            # 推进仿真
+            p.stepSimulation()
+            if gui:
+                time.sleep(dt)
+            # 如果所有关节都已到达目标位置
+            if all_reached:
+                print("Reached target position, sleeping 2 seconds...")
+                time.sleep(2.0)
+                reached_target = True
+
+        # prev_action = action
+        # # Step simulation
+        # p.stepSimulation()
+        # # link6_pos, link6_quat = get_link_state(robot_id, cfg.robot_config.end_effector_link)
+        # # link6_rpy = p.getEulerFromQuaternion(link6_quat)
+        # # draw_axes(link6_pos, link6_rpy, visuals_list=link6_axis_visuals)
+        # # If using GUI, maintain real-time simulation
+        # if gui:
+        #     time.sleep(dt)
         
         # Increment counter
         count_lowlevel += 1

@@ -37,6 +37,7 @@ from scipy.spatial.transform import Rotation as R
 import torch
 import random
 import argparse
+import time
 
 
 class Sim2simCfg:
@@ -116,20 +117,20 @@ class ReachTaskConfig:
         return False
 
 
-def get_obs(model,data, cfg, task_cfg):
-    """Extract observations from the MuJoCo data structure
+def get_obs(robot, cfg, task_cfg):
+    """Extract observations from the robot interface
     
     Args:
-        data: MuJoCo simulation data
+        robot: Robot interface object
         cfg: Configuration object
         task_cfg: Task configuration
         
     Returns:
         Observation vector matching the training environment's format
     """
-    # Extract joint positions and velocities
-    q = data.qpos[-cfg.env.num_actions:].astype(np.double)
-    dq = data.qvel[-cfg.env.num_actions:].astype(np.double)
+    # Extract joint positions and velocities from robot interface
+    q = robot.get_current_joint_q().astype(np.double)
+    dq = robot.get_current_joint_v().astype(np.double)
     
     # Create observation vector
     obs = np.zeros(cfg.env.num_single_obs, dtype=np.float32)
@@ -139,38 +140,30 @@ def get_obs(model,data, cfg, task_cfg):
     
     # 2. Joint velocities (normalized)
     obs[6:12] = dq * cfg.normalization.obs_scales.dof_vel
-    # print(f"Joint positions: {obs[0:6]}, Joint velocities: {obs[6:12]}")
-    # 3.  end-effector position (command)
-
+    
+    # 3. end-effector position (command)
     obs[12:15] = task_cfg.target_pos
     quat = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
     obs[15:19] = quat
+    
     # 6. Previous action (will be updated in the main loop)
     obs[19:25] = np.zeros(6)  # Will store the previous action
     
     return obs
 
 
-def run_mujoco(policy, cfg, task_cfg):
-    """Run the MuJoCo simulation with the provided policy
+def run_robot(policy, cfg, task_cfg, robot):
+    """Run the robot control with the provided policy
     
     Args:
         policy: PyTorch policy model
-        cfg: Simulation configuration
+        cfg: Configuration object
         task_cfg: Task configuration
+        robot: Robot interface object
         
     Returns:
         None
     """
-    # Load model and initialize data
-    model = mujoco.MjModel.from_xml_path(cfg.sim_config.mujoco_model_path)
-    model.opt.timestep = cfg.sim_config.dt
-    data = mujoco.MjData(model)
-    
-    # Initialize MuJoCo
-    mujoco.mj_step(model, data)
-    viewer = mujoco_viewer.MujocoViewer(model, data)
-    
     # Initialize control variables
     target_q = np.zeros(cfg.env.num_actions, dtype=np.double)
     action = np.zeros(cfg.env.num_actions, dtype=np.double)
@@ -188,16 +181,13 @@ def run_mujoco(policy, cfg, task_cfg):
     # Initialize simulation counter
     count_lowlevel = 0
     first_action = True 
-    target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'target')
-    if target_body_id == -1:
-        print("Warning: 'target' body not found in model")
-
+    
     # 用于存储下一个目标位置
     target_next = np.zeros(cfg.env.num_actions, dtype=np.double)
     
-    # Main simulation loop
+    # Main control loop
     total_steps = int(cfg.sim_config.sim_duration / cfg.sim_config.dt)
-    for step in tqdm(range(total_steps), desc="Simulating..."):
+    for step in tqdm(range(total_steps), desc="Running robot..."):
         dt = cfg.sim_config.dt
         
         # 更新动作计时器
@@ -206,24 +196,11 @@ def run_mujoco(policy, cfg, task_cfg):
         # Update target if needed
         if task_cfg.update_target(dt):
             print(f"New target: {task_cfg.target_pos}")
-        if target_body_id != -1:
-            # 如果target是mocap body
-            if model.body_mocapid[target_body_id] != -1:
-                mocap_id = model.body_mocapid[target_body_id]
-                data.mocap_pos[mocap_id] = task_cfg.target_pos
-                # # 如果需要设置方向
-                # rot_matrix = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_matrix()
-                # data.mocap_quat[mocap_id] = R.from_matrix(rot_matrix).as_quat()
 
-
-        # Get current joint positions and velocities
-        q = data.qpos[-cfg.env.num_actions:].astype(np.double)
-        dq = data.qvel[-cfg.env.num_actions:].astype(np.double)
-        
         # Policy runs at lower frequency (100Hz)
         if count_lowlevel % cfg.sim_config.decimation == 0:
             # Get full observation
-            obs = get_obs(model,data, cfg, task_cfg)
+            obs = get_obs(robot, cfg, task_cfg)
             # Update the previous action in observation
             obs[19:25] = prev_action
             
@@ -261,7 +238,7 @@ def run_mujoco(policy, cfg, task_cfg):
             target_q = target_next.copy()  # 将下一个目标作为当前目标
             action_timer = 0.0  # 重置计时器
         
-        # Apply position control directly to the joints
+        # Apply position control to the robot
         # Clip targets to joint limits for safety
         target_q_clipped = np.clip(
             target_q, 
@@ -274,35 +251,26 @@ def run_mujoco(policy, cfg, task_cfg):
             print(f"当前目标: {target_q}")
             print(f"下一目标: {target_next}")
         
-        # Set direct position target for each actuator
-        data.ctrl = target_q_clipped
-
-        # Step simulation
-        mujoco.mj_step(model, data)
+        # Send position command to robot
+        robot.set_joint_positions(target_q_clipped)
         
-        # Render
-        viewer.render()
+        # Sleep to maintain control frequency
+        time.sleep(dt)
         
         # Increment counter
         count_lowlevel += 1
-    
-    # Close viewer when done
-    viewer.close()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment')
     parser.add_argument('--load_model', type=str, required=True,
                       help='Path to the trained policy model')
-    parser.add_argument('--model_path', type=str, default='/home/LYR/humanoid-gym/resources/robots/airbot/airbot_play_v3_0_gripper.xml',
-                      help='Path to the MuJoCo XML model file')
     parser.add_argument('--switch_interval', type=float, default=3.0,
                       help='Time interval (seconds) between switching actions')
     args = parser.parse_args()
     
     # Update configuration with command line arguments
     cfg = Sim2simCfg()
-    cfg.sim_config.mujoco_model_path = args.model_path
     
     # For frame stacking, adjust observation dimension
     if cfg.env.frame_stack > 1:
@@ -314,5 +282,8 @@ if __name__ == '__main__':
     # Load policy
     policy = torch.jit.load(args.load_model)
     
-    # Run simulation
-    run_mujoco(policy, cfg, task_cfg)
+    # Initialize robot interface
+    robot = RobotInterface()  # 需要实现这个类
+    
+    # Run robot control
+    run_robot(policy, cfg, task_cfg, robot)

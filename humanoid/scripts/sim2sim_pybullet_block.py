@@ -15,7 +15,7 @@ class Sim2simCfg:
     class sim_config:
         urdf_model_path = '/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper.urdf'  # Update with actual URDF path
         sim_duration = 60.0
-        dt = 1/200
+        dt = 1/60
         decimation = 2
 
     class env:
@@ -50,60 +50,73 @@ class Sim2simCfg:
 
 
 class ReachTaskConfig:
-    """Configuration for the reaching task"""
-    def __init__(self):
-        # Target position ranges (similar to your command ranges)
-        self.pos_range_x = (0.35, 0.65)
-        self.pos_range_y = (-0.2,0.2)
-        self.pos_range_z = (0.15, 0.5)
+    """Configuration for the reaching task with proper blocking behavior"""
+    def __init__(self, block_duration=5.0):
+        # Target position ranges 
+        self.pos_range_x = (0.5, 0.5)
+        self.pos_range_y = (0, 0)
+        self.pos_range_z = (0.3, 0.3)
         self.pos_range_roll = (math.pi/2, math.pi/2)
-        self.pos_range_pitch = (math.pi/2, math.pi*3/2)
+        self.pos_range_pitch = (math.pi, math.pi)
         self.pos_range_yaw = (math.pi/2, math.pi/2)
-        # self.pos_range_yaw = (0, 0)
-        # Current target position
-        self.target_pos = np.array([
+        
+        # State management
+        self.block_duration = block_duration
+        self.blocked_time = 0.0
+        self.is_first_action = True
+        self.is_blocking = False
+        
+        # Target positions
+        self.target_pos_1 = np.array([
             random.uniform(*self.pos_range_x),
             random.uniform(*self.pos_range_y),
             random.uniform(*self.pos_range_z)
         ])
-        self.target_rpy = np.array([
+        self.target_rpy_1 = np.array([
             random.uniform(*self.pos_range_roll),
             random.uniform(*self.pos_range_pitch),
             random.uniform(*self.pos_range_yaw)
         ])
-
-        # Target update frequency (in seconds)
-        self.target_update_time = 4.0
-        self.time_since_last_update = 0.0
         
-        # Target visualization (will be initialized in the main function)
+        self.target_pos_2 = np.array([
+            random.uniform(*self.pos_range_x),
+            random.uniform(*self.pos_range_y),
+            random.uniform(*self.pos_range_z)
+        ])
+        self.target_rpy_2 = np.array([
+            random.uniform(*self.pos_range_roll),
+            random.uniform(*self.pos_range_pitch),
+            random.uniform(*self.pos_range_yaw)
+        ])
+        
+        # Current target (will be updated)
+        self.current_target_pos = self.target_pos_1
+        self.current_target_rpy = self.target_rpy_1
+        
+        # Target visualization
         self.target_visual_id = None
     
-    def update_target(self, dt):
-        """Update target position if needed"""
-        self.time_since_last_update += dt
-        if self.time_since_last_update >= self.target_update_time:
-            self.target_pos[0] = random.uniform(*self.pos_range_x)
-            self.target_pos[1] = random.uniform(*self.pos_range_y)
-            self.target_pos[2] = random.uniform(*self.pos_range_z)
-
-            self.target_rpy[0] = random.uniform(*self.pos_range_roll)
-            self.target_rpy[1] = random.uniform(*self.pos_range_pitch)
-            self.target_rpy[2] = random.uniform(*self.pos_range_yaw)
-            self.time_since_last_update = 0.0
-            return True
+    def update_task_state(self, dt):
+        """Manage task state with proper blocking"""
+        if self.is_blocking:
+            self.blocked_time += dt
+            if self.blocked_time >= self.block_duration:
+                # Switch to next target and reset blocking
+                self.is_blocking = False
+                self.blocked_time = 0.0
+                self.is_first_action = False
+                
+                # Switch to second target
+                self.current_target_pos = self.target_pos_2
+                self.current_target_rpy = self.target_rpy_2
+                
+                return True  # Indicates a target change
+        
         return False
 
 
 def init_pybullet(gui=True):
-    """Initialize PyBullet simulation environment
-    
-    Args:
-        gui: Whether to use GUI visualization
-        
-    Returns:
-        Physics client ID
-    """
+    """Initialize PyBullet simulation environment"""
     if gui:
         physicsClient = p.connect(p.GUI)
     else:
@@ -116,7 +129,6 @@ def init_pybullet(gui=True):
     # Load plane
     p.loadURDF("plane.urdf")
     
-    return physicsClient
 
 
 def load_robot(cfg):
@@ -333,8 +345,8 @@ def get_obs(robot_id, joint_indices, end_effector_link, cfg, task_cfg):
     obs[6:12] = dq * cfg.normalization.obs_scales.dof_vel
     
     # 3. Target position and orientation
-    obs[12:15] = task_cfg.target_pos
-    quat = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
+    obs[12:15] = task_cfg.target_pos_1
+    quat = R.from_euler('ZYX', task_cfg.target_rpy_1[::-1]).as_quat()
     # Convert to [x, y, z, w] format
     quat = np.array([quat[1], quat[2], quat[3], quat[0]])
     obs[15:19] = quat
@@ -344,36 +356,24 @@ def get_obs(robot_id, joint_indices, end_effector_link, cfg, task_cfg):
     
     return obs
 
-
 def run_pybullet(policy, cfg, task_cfg, gui=True):
-    """Run the PyBullet simulation with the provided policy
-    
-    Args:
-        policy: PyTorch policy model
-        cfg: Simulation configuration
-        task_cfg: Task configuration
-        gui: Whether to use GUI visualization
-        
-    Returns:
-        None
-    """
+    """Run the PyBullet simulation with proper blocking behavior"""
     # Initialize PyBullet
     physicsClient = init_pybullet(gui)
     
     # Load robot and get joint indices
     robot_id, joint_indices = load_robot(cfg)
     
-    # Create target visual
+    # Create initial target visual
     task_cfg.target_visual_id = create_target_visual(
-        task_cfg.target_pos, 
-        task_cfg.target_rpy
+        task_cfg.current_target_pos, 
+        task_cfg.current_target_rpy
     )
     
     # Initialize control variables
     target_q = np.zeros(cfg.env.num_actions, dtype=np.double)
     action = np.zeros(cfg.env.num_actions, dtype=np.double)
     prev_action = np.zeros(cfg.env.num_actions, dtype=np.double)
-    
     
     # Initialize observation history for frame stacking if used
     hist_obs = deque()
@@ -389,20 +389,29 @@ def run_pybullet(policy, cfg, task_cfg, gui=True):
     
     # Main simulation loop
     for step in tqdm(range(total_steps), desc="Simulating..."):
-        # Update target if needed
-        if task_cfg.update_target(dt):
-            print(f"link6_pos:{get_link_state(robot_id, cfg.robot_config.end_effector_link)[0]}")
-            print(f"New target: {task_cfg.target_pos}")
+        # Update task state and check for target change
+        target_updated = task_cfg.update_task_state(dt)
+        
+        if target_updated:
+            # Update visual and print target info when target changes
+            print(f"link6_pos: {get_link_state(robot_id, cfg.robot_config.end_effector_link)[0]}")
+            print(f"New target: {task_cfg.current_target_pos}")
             update_target_visual(
-                task_cfg.target_pos, 
-                task_cfg.target_rpy
+                task_cfg.current_target_pos, 
+                task_cfg.current_target_rpy
             )
         
         # Policy runs at lower frequency (based on decimation factor)
         if count_lowlevel % cfg.sim_config.decimation == 0:
             # Get full observation
-            obs = get_obs(robot_id, joint_indices, cfg.robot_config.end_effector_link, cfg, task_cfg)
-            
+            obs = get_obs(
+                robot_id, 
+                joint_indices, 
+                cfg.robot_config.end_effector_link, 
+                cfg, 
+                task_cfg
+            )
+
             # Update the previous action in observation
             obs[19:25] = prev_action
             
@@ -419,20 +428,28 @@ def run_pybullet(policy, cfg, task_cfg, gui=True):
                     policy_input[0, start_idx:end_idx] = hist_obs[i]
             else:
                 policy_input = obs.reshape(1, -1)
+            print(f"Policy input: {policy_input}")
+            # Compute action based on task state
+            if not task_cfg.is_blocking:
+                action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
+                target_q = action * cfg.control.action_scale
                 
-            # Always calculate next target position
-            action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
-            
+                # If this is the first action, start blocking after computing it
+                if task_cfg.is_first_action:
+                    task_cfg.is_blocking = True
+                    task_cfg.blocked_time = 0.0
+     
+                prev_action = action
+        
         # Apply position control to the joints
         target_q_clipped = np.clip(
             target_q, 
             cfg.robot_config.joint_lower_limits, 
             cfg.robot_config.joint_upper_limits
         )
-
+        print(f"Target joint positions: {target_q_clipped}")
         # Apply pure position control to each joint
         for i, joint_idx in enumerate(joint_indices):
-            # Direct position control
             p.setJointMotorControl2(
                 bodyUniqueId=robot_id,
                 jointIndex=joint_idx,
@@ -440,12 +457,11 @@ def run_pybullet(policy, cfg, task_cfg, gui=True):
                 targetPosition=target_q_clipped[i],
                 maxVelocity=5.0  # Optional: limit velocity of the movement
             )
-        prev_action = action
+            print(f"Joint target position: {target_q_clipped}")
+        
         # Step simulation
         p.stepSimulation()
-        # link6_pos, link6_quat = get_link_state(robot_id, cfg.robot_config.end_effector_link)
-        # link6_rpy = p.getEulerFromQuaternion(link6_quat)
-        # draw_axes(link6_pos, link6_rpy, visuals_list=link6_axis_visuals)
+        
         # If using GUI, maintain real-time simulation
         if gui:
             time.sleep(dt)
@@ -456,15 +472,14 @@ def run_pybullet(policy, cfg, task_cfg, gui=True):
     # Disconnect when done
     p.disconnect()
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AirBot Reach Task Deployment (PyBullet)')
     parser.add_argument('--load_model', type=str, required=True,
                       help='Path to the trained policy model')
     parser.add_argument('--model_path', type=str, default='/home/yurong/下载/airbot_usd/urdf/airbot_play_v3_0_gripper.urdf',
                       help='Path to the robot URDF file')
-    parser.add_argument('--switch_interval', type=float, default=3.0,
-                      help='Time interval (seconds) between switching actions')
+    parser.add_argument('--block_duration', type=float, default=10.0,
+                      help='Duration to stop at each target position (seconds)')
     parser.add_argument('--headless', action='store_true',
                       help='Run in headless mode (no GUI)')
     args = parser.parse_args()
@@ -477,8 +492,8 @@ if __name__ == '__main__':
     if cfg.env.frame_stack > 1:
         cfg.env.num_observations = cfg.env.num_single_obs * cfg.env.frame_stack
     
-    # Initialize task configuration
-    task_cfg = ReachTaskConfig()
+    # Initialize task configuration with blocking duration
+    task_cfg = ReachTaskConfig(block_duration=args.block_duration)
     
     # Load policy
     policy = torch.jit.load(args.load_model)

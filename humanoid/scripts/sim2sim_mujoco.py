@@ -43,8 +43,8 @@ class Sim2simCfg:
     class sim_config:
         mujoco_model_path = '/home/yurong/humanoid-gym/resources/robots/airbot/airbot_play_v3_0_gripper.xml'  # Update with your actual path
         sim_duration = 60.0
-        dt = 0.001
-        decimation = 10
+        dt = 0.005
+        decimation = 2
 
     class env:
         num_actions = 6  # 6 joints for the airbot
@@ -142,16 +142,12 @@ def get_obs(model,data, cfg, task_cfg):
     # print(f"Joint positions: {obs[0:6]}, Joint velocities: {obs[6:12]}")
     # 3.  end-effector position (command)
     # ✳️ Add link6 pose and orientation
-    link6_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "link6")
-    if link6_id != -1:
-        pos = data.xpos[link6_id]
-        quat = data.xquat[link6_id]
-        # Optional: reorder to (x, y, z, w) if needed
-        obs[12:15] = pos
-        obs[15:19] = quat  # or link6_quat[[1,2,3,0]] if you want xyzw format
-        # print(f"Link6 position: {pos}, orientation (quat): {quat}")
-    else:
-        print("Warning: 'link6' not found in the model.")
+    # 3. Target position and orientation
+    obs[12:15] = task_cfg.target_pos
+    quat = R.from_euler('ZYX', task_cfg.target_rpy[::-1]).as_quat()
+    # Convert to [x, y, z, w] format
+    quat = np.array([quat[1], quat[2], quat[3], quat[0]])
+    obs[15:19] = quat
     
     # 6. Previous action (will be updated in the main loop)
     obs[19:25] = np.zeros(6)  # Will store the previous action
