@@ -422,7 +422,7 @@ def run_pybullet(policy, cfg, task_cfg, gui=True):
                 
             # Always calculate next target position
             action = policy(torch.tensor(policy_input, dtype=torch.float32))[0].detach().numpy()
-            
+            target_q = action * cfg.control.action_scale
         # Apply position control to the joints
         target_q_clipped = np.clip(
             target_q, 
